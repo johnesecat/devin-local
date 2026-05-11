@@ -1,0 +1,22 @@
+{
+  "$schema": "https://example.invalid/devin-local/mcp_servers.schema.json",
+  "_comment": "Example MCP server configuration. Remove `_disabled` entries and adjust paths to enable. Requires `pip install devin-local[mcp]`.",
+  "servers": [
+    {
+      "_disabled": true,
+      "name": "filesystem",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "."
+      ]
+    },
+    {
+      "_disabled": true,
+      "name": "git",
+      "command": "uvx",
+      "args": ["mcp-server-git"]
+    }
+  ]
+}
