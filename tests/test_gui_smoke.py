@@ -73,3 +73,22 @@ def test_main_window_builds_and_lists_all_backends(qapp, tmp_path: Path) -> None
         assert "devin-local" in win.windowTitle()
     finally:
         win.close()
+
+
+def test_shutdown_agent_disconnects_request_submit_from_old_worker(qapp, tmp_path: Path) -> None:
+    """_shutdown_agent must disconnect request_submit from the old worker's
+    submit slot, otherwise each backend/workspace switch leaks the previous
+    worker via a dangling signal connection (Devin Review BUG_0001)."""
+    win = MainWindow(workspace=tmp_path, backend="ollama", model="llama3.1:8b")
+    try:
+        worker_a = win._worker
+        assert worker_a is not None
+        win._shutdown_agent()
+        # After the fix, the connection was removed. Trying to disconnect
+        # again must emit a "Failed to disconnect" RuntimeWarning. Before
+        # the fix, this disconnect would succeed silently because the
+        # leftover connection was never cleaned up.
+        with pytest.warns(RuntimeWarning, match="Failed to disconnect"):
+            win.request_submit.disconnect(worker_a.submit)
+    finally:
+        win.close()

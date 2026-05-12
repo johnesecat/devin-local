@@ -265,6 +265,8 @@ class MainWindow(QMainWindow):
     def _shutdown_agent(self) -> None:
         if self._worker is not None:
             with contextlib.suppress(Exception):
+                self.request_submit.disconnect(self._worker.submit)
+            with contextlib.suppress(Exception):
                 self._worker.shutdown()
         if self._worker_thread is not None:
             with contextlib.suppress(Exception):

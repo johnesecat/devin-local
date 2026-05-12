@@ -146,6 +146,89 @@ def test_agent_streaming_runs_tool_calls(workspace: Path) -> None:
     assert (workspace / "out.txt").read_text() == "hi"
 
 
+def test_stream_user_yields_chunks_before_turn_completes(workspace: Path) -> None:
+    """stream_user() must yield chunks incrementally, not buffer them all
+    until the agent turn finishes (Devin Review BUG_0002)."""
+
+    import threading
+    import time
+    from collections.abc import Iterator as _Iter
+
+    backend_yielded: list[float] = []
+    consumer_received: list[float] = []
+    release_next = threading.Event()
+
+    class _BlockingBackend(InferenceBackend):
+        """Streams 3 chunks; blocks on an Event between the 1st and 2nd."""
+
+        name = "blocking"
+
+        def chat(self, model, messages, tools=None, options=None, keep_alive=None):
+            raise NotImplementedError
+
+        def stream(
+            self,
+            model: str,
+            messages: list[ChatMessage],
+            tools=None,
+            options=None,
+            keep_alive=None,
+        ) -> _Iter[ChatChunk]:
+            yield ChatChunk(delta="first ", done=False, message=None)
+            backend_yielded.append(time.monotonic())
+            # Wait until the consumer has actually received the first chunk
+            # before producing more. If stream_user buffered, this deadlocks.
+            assert release_next.wait(5.0), "consumer never received first chunk"
+            yield ChatChunk(delta="second ", done=False, message=None)
+            backend_yielded.append(time.monotonic())
+            yield ChatChunk(
+                delta="",
+                done=True,
+                message=ChatMessage(role="assistant", content="first second "),
+            )
+            backend_yielded.append(time.monotonic())
+
+        def summarize(self, model, text, max_tokens=512, instruction=None) -> str:
+            return text
+
+        def is_available(self) -> bool:
+            return True
+
+        def list_models(self) -> list[str]:
+            return ["blocking"]
+
+    backend = _BlockingBackend()
+    agent = Agent(
+        AgentConfig(
+            workspace=workspace,
+            model="any",
+            enable_mcp=False,
+            enable_plugins=False,
+            enable_knowledge_injection=False,
+            enable_skill_injection=False,
+        ),
+        backend=backend,
+    )
+    try:
+        deltas: list[str] = []
+        for chunk in agent.stream_user("go"):
+            consumer_received.append(time.monotonic())
+            if not chunk.done and chunk.delta:
+                deltas.append(chunk.delta)
+            if chunk.delta == "first ":
+                # Releases the backend; if stream_user buffered, this line
+                # never runs and the backend deadlocks on the Event.
+                release_next.set()
+        assert deltas == ["first ", "second "]
+        # First consumer receipt must happen BEFORE the backend yields its last chunk.
+        assert consumer_received[0] < backend_yielded[-1], (
+            "stream_user buffered all chunks instead of yielding incrementally"
+        )
+    finally:
+        release_next.set()
+        agent.shutdown()
+
+
 def test_agent_caches_system_prompt_across_turns(workspace: Path) -> None:
     backend = _ScriptedBackend(
         script=[

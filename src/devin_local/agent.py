@@ -294,20 +294,46 @@ class Agent:
     def stream_user(self, text: str) -> Iterator[ChatChunk]:
         """Generator variant of `handle_user` that yields chunks as they arrive.
 
-        After the generator is exhausted, `self.messages` holds the full
-        updated transcript and any tool calls have been dispatched.
+        The agent's turn runs on a background thread; chunks are handed off to
+        the calling thread through a thread-safe queue so callers see token
+        deltas immediately (not buffered until the turn completes). After the
+        generator is exhausted, ``self.messages`` holds the full updated
+        transcript and any tool calls have been dispatched.
         """
-        chunks: list[ChatChunk] = []
+        import queue
+        import threading
+
+        sentinel = object()
+        q: queue.Queue[Any] = queue.Queue()
 
         def _collect(chunk: ChatChunk) -> None:
-            chunks.append(chunk)
+            q.put(chunk)
+
+        def _run() -> None:
+            try:
+                self.handle_user(text, stream=True)
+            except BaseException as exc:  # noqa: BLE001
+                q.put(exc)
+            finally:
+                q.put(sentinel)
 
         self.add_stream_observer(_collect)
+        worker = threading.Thread(target=_run, daemon=True, name="agent-stream")
+        worker.start()
         try:
-            self.handle_user(text, stream=True)
+            while True:
+                item = q.get()
+                if item is sentinel:
+                    break
+                if isinstance(item, BaseException):
+                    raise item
+                yield item
         finally:
-            self._stream_observers.remove(_collect)
-        yield from chunks
+            import contextlib as _ctx
+
+            with _ctx.suppress(ValueError):
+                self._stream_observers.remove(_collect)
+            worker.join(timeout=5.0)
 
     def _summarize(self, text: str, max_tokens: int) -> str:
         try:
