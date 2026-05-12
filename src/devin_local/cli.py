@@ -27,9 +27,13 @@ from rich.table import Table
 
 from devin_local import __version__
 from devin_local.agent import Agent, AgentConfig
+from devin_local.inference.backend import BackendUnavailableError, ChatChunk
+from devin_local.inference.factory import SUPPORTED_BACKENDS, list_available_backends
 from devin_local.knowledge.store import KnowledgeStore
 from devin_local.models import get_model_spec, suggest_abliterated
 from devin_local.ollama_client import OllamaClient, OllamaError
+
+DEFAULT_BACKEND = "ollama"
 
 app = typer.Typer(
     add_completion=False,
@@ -63,11 +67,17 @@ def _build_agent(
     no_knowledge: bool,
     no_skills: bool,
     session: Path | None,
+    backend: str = DEFAULT_BACKEND,
+    backend_options: dict | None = None,
+    keep_alive: str | int | None = None,
 ) -> Agent:
     cfg = AgentConfig(
         model=model,
         workspace=workspace,
+        backend=backend,
+        backend_options=backend_options or {},
         ollama_host=host,
+        keep_alive=keep_alive,
         enable_obliteratus=obliteratus,
         enable_desktop=not no_desktop,
         enable_browser=not no_browser,
@@ -78,6 +88,71 @@ def _build_agent(
         session_path=session,
     )
     return Agent(cfg)
+
+
+def _validate_backend(name: str) -> str:
+    name = (name or DEFAULT_BACKEND).lower()
+    if name not in SUPPORTED_BACKENDS:
+        raise typer.BadParameter(
+            f"Unknown backend {name!r}. Choose one of: {', '.join(SUPPORTED_BACKENDS)}."
+        )
+    return name
+
+
+def _backend_options(
+    backend: str,
+    *,
+    model_path: str | None = None,
+    compression: str | None = None,
+    layer_cache: Path | None = None,
+    device_map: str = "auto",
+    load_4bit: bool = False,
+    load_8bit: bool = False,
+    trust_remote_code: bool = False,
+) -> dict:
+    """Assemble the kwargs dict passed to `build_backend(backend, **opts)`."""
+    if backend == "layered":
+        opts: dict = {}
+        if model_path:
+            opts["model_id"] = model_path
+        if compression:
+            opts["compression"] = None if compression.lower() == "none" else compression
+        if layer_cache:
+            opts["layer_cache_dir"] = str(layer_cache)
+        return opts
+    if backend == "hf":
+        opts = {
+            "device_map": device_map,
+            "load_in_4bit": load_4bit,
+            "load_in_8bit": load_8bit,
+            "trust_remote_code": trust_remote_code,
+        }
+        if model_path:
+            opts["model_id"] = model_path
+        return opts
+    return {}
+
+
+def _parse_keep_alive(raw: str | None) -> str | int | None:
+    """Pass numeric `keep_alive` as int, duration strings (e.g. '10m') as str."""
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return raw
+
+
+def _streaming_printer(console: Console):
+    """Return a stream-observer that prints token deltas live."""
+
+    def _emit(chunk: ChatChunk) -> None:
+        if chunk.done:
+            return
+        if chunk.delta:
+            console.print(chunk.delta, end="", soft_wrap=True, highlight=False)
+
+    return _emit
 
 
 @app.callback()
@@ -95,7 +170,7 @@ def version() -> None:
 def doctor(
     host: str = typer.Option("http://127.0.0.1:11434", help="Ollama host URL."),
 ) -> None:
-    """Run a health check: Ollama reachable + models installed + python version."""
+    """Run a health check: Python + every backend + installed models."""
     console = _console()
     table = Table(title="devin-local doctor")
     table.add_column("Check")
@@ -128,6 +203,12 @@ def doctor(
             "Install from https://ollama.com/download and run `ollama serve`.",
         )
     client.close()
+
+    table.add_row("", "", "")
+    for entry in list_available_backends():
+        status = "ok" if entry["available"] else "missing"
+        table.add_row(f"backend:{entry['name']}", status, entry["details"])
+
     console.print(table)
 
 
@@ -249,6 +330,32 @@ def run(
     model: str = typer.Option("llama3.1:8b", "--model", "-m"),
     workspace: Path = typer.Option(Path.cwd(), "--workspace", "-w"),
     host: str = typer.Option("http://127.0.0.1:11434", "--host"),
+    backend: str = typer.Option(
+        DEFAULT_BACKEND,
+        "--backend",
+        "-b",
+        envvar="DEVIN_LOCAL_DEFAULT_BACKEND",
+        help="Inference backend: ollama | layered | hf.",
+    ),
+    model_path: str | None = typer.Option(
+        None,
+        "--model-path",
+        help="For layered/hf: HuggingFace model id or local path.",
+    ),
+    compression: str = typer.Option("4bit", "--compression", help="Layered: 4bit | 8bit | none."),
+    layer_cache: Path | None = typer.Option(
+        None, "--layer-cache", help="Layered: directory to cache per-layer shards."
+    ),
+    device_map: str = typer.Option("auto", "--device-map", help="HF: auto|cpu|cuda|..."),
+    load_4bit: bool = typer.Option(False, "--load-4bit", help="HF: bitsandbytes 4-bit."),
+    load_8bit: bool = typer.Option(False, "--load-8bit", help="HF: bitsandbytes 8-bit."),
+    trust_remote_code: bool = typer.Option(
+        False, "--trust-remote-code", help="HF: allow custom model code."
+    ),
+    keep_alive: str | None = typer.Option(
+        None, "--keep-alive", help="Ollama: keep model resident (e.g. '10m', '-1')."
+    ),
+    stream: bool = typer.Option(True, "--stream/--no-stream", help="Stream tokens."),
     obliteratus: bool = typer.Option(True, "--obliteratus/--no-obliteratus"),
     no_desktop: bool = typer.Option(False, "--no-desktop"),
     no_browser: bool = typer.Option(False, "--no-browser"),
@@ -260,10 +367,24 @@ def run(
 ) -> None:
     """Run a single task to completion and print the final assistant reply."""
     console = _console()
+    backend = _validate_backend(backend)
+    backend_options = _backend_options(
+        backend,
+        model_path=model_path,
+        compression=compression,
+        layer_cache=layer_cache,
+        device_map=device_map,
+        load_4bit=load_4bit,
+        load_8bit=load_8bit,
+        trust_remote_code=trust_remote_code,
+    )
     agent = _build_agent(
         model=model,
         workspace=workspace,
         host=host,
+        backend=backend,
+        backend_options=backend_options,
+        keep_alive=_parse_keep_alive(keep_alive),
         obliteratus=obliteratus,
         no_desktop=no_desktop,
         no_browser=no_browser,
@@ -279,19 +400,23 @@ def run(
         console.print(f"[dim][tool {tool_name} -> {kind}][/dim]")
 
     agent.add_tool_observer(_observer)
+    if stream:
+        agent.add_stream_observer(_streaming_printer(console))
     try:
         start = time.monotonic()
-        turn = agent.handle_user(task)
+        turn = agent.handle_user(task, stream=stream)
         elapsed = time.monotonic() - start
-    except OllamaError as exc:
-        console.print(f"[red]Ollama error:[/red] {exc}")
+    except (OllamaError, BackendUnavailableError) as exc:
+        console.print(f"[red]{type(exc).__name__}:[/red] {exc}")
         raise typer.Exit(1) from exc
     finally:
         agent.shutdown()
+    if stream:
+        console.print()  # flush trailing newline after streamed output
     _print_turn(console, "assistant", turn.assistant_text)
     console.print(
         f"[dim]({turn.iterations} iterations, "
-        f"{len(turn.tool_results)} tool call(s), {elapsed:.1f}s)[/dim]"
+        f"{len(turn.tool_results)} tool call(s), {elapsed:.1f}s, backend={backend})[/dim]"
     )
 
 
@@ -300,6 +425,22 @@ def chat(
     model: str = typer.Option("llama3.1:8b", "--model", "-m"),
     workspace: Path = typer.Option(Path.cwd(), "--workspace", "-w"),
     host: str = typer.Option("http://127.0.0.1:11434", "--host"),
+    backend: str = typer.Option(
+        DEFAULT_BACKEND,
+        "--backend",
+        "-b",
+        envvar="DEVIN_LOCAL_DEFAULT_BACKEND",
+        help="Inference backend: ollama | layered | hf.",
+    ),
+    model_path: str | None = typer.Option(None, "--model-path"),
+    compression: str = typer.Option("4bit", "--compression"),
+    layer_cache: Path | None = typer.Option(None, "--layer-cache"),
+    device_map: str = typer.Option("auto", "--device-map"),
+    load_4bit: bool = typer.Option(False, "--load-4bit"),
+    load_8bit: bool = typer.Option(False, "--load-8bit"),
+    trust_remote_code: bool = typer.Option(False, "--trust-remote-code"),
+    keep_alive: str | None = typer.Option(None, "--keep-alive"),
+    stream: bool = typer.Option(True, "--stream/--no-stream"),
     obliteratus: bool = typer.Option(True, "--obliteratus/--no-obliteratus"),
     no_desktop: bool = typer.Option(False, "--no-desktop"),
     no_browser: bool = typer.Option(False, "--no-browser"),
@@ -311,10 +452,24 @@ def chat(
 ) -> None:
     """Start an interactive chat REPL with the agent."""
     console = _console()
+    backend = _validate_backend(backend)
+    backend_options = _backend_options(
+        backend,
+        model_path=model_path,
+        compression=compression,
+        layer_cache=layer_cache,
+        device_map=device_map,
+        load_4bit=load_4bit,
+        load_8bit=load_8bit,
+        trust_remote_code=trust_remote_code,
+    )
     agent = _build_agent(
         model=model,
         workspace=workspace,
         host=host,
+        backend=backend,
+        backend_options=backend_options,
+        keep_alive=_parse_keep_alive(keep_alive),
         obliteratus=obliteratus,
         no_desktop=no_desktop,
         no_browser=no_browser,
@@ -324,6 +479,8 @@ def chat(
         no_skills=no_skills,
         session=session,
     )
+    if stream:
+        agent.add_stream_observer(_streaming_printer(console))
 
     def _observer(tool_name: str, args, result) -> None:  # noqa: ANN001
         kind = "[green]ok[/green]" if result.ok else "[red]err[/red]"
@@ -362,18 +519,83 @@ def chat(
                 console.print("[dim](history reset)[/dim]")
                 continue
             try:
-                turn = agent.handle_user(user)
-            except OllamaError as exc:
-                console.print(f"[red]Ollama error:[/red] {exc}")
+                turn = agent.handle_user(user, stream=stream)
+            except (OllamaError, BackendUnavailableError) as exc:
+                console.print(f"[red]{type(exc).__name__}:[/red] {exc}")
                 continue
+            if stream:
+                console.print()
             _print_turn(console, "assistant", turn.assistant_text)
     finally:
         agent.shutdown()
 
 
+@app.command("backends")
+def backends_list() -> None:
+    """List available inference backends with install / runtime status."""
+    console = _console()
+    table = Table(title="inference backends")
+    table.add_column("Backend")
+    table.add_column("Status")
+    table.add_column("Details")
+    for entry in list_available_backends():
+        status = "[green]ready[/green]" if entry["available"] else "[yellow]missing[/yellow]"
+        table.add_row(entry["name"], status, entry["details"])
+    console.print(table)
+
+
+@app.command("gui")
+def gui(
+    workspace: Path = typer.Option(Path.cwd(), "--workspace", "-w"),
+    backend: str = typer.Option(DEFAULT_BACKEND, "--backend", "-b"),
+    model: str = typer.Option("llama3.1:8b", "--model", "-m"),
+    host: str = typer.Option("http://127.0.0.1:11434", "--host"),
+) -> None:
+    """Launch the PySide6 desktop GUI."""
+    try:
+        from devin_local.gui.app import launch_gui
+    except ImportError as exc:
+        typer.echo(
+            "GUI dependencies not installed. Install with:\n"
+            "    pip install devin-local[gui]\n"
+            f"(import error: {exc})",
+            err=True,
+        )
+        raise typer.Exit(2) from exc
+    launch_gui(workspace=workspace, backend=_validate_backend(backend), model=model, host=host)
+
+
 def main() -> None:
-    """Module-level entry point used by the console script."""
+    """Module-level entry point used by the `devin-local` console script."""
     app()
+
+
+def main_layered() -> None:
+    """Console-script entry point for `devin-local-layered`.
+
+    Sets the ``DEVIN_LOCAL_DEFAULT_BACKEND`` env var to ``layered`` so the
+    `run` / `chat` commands default to AirLLM-style loading. Users can still
+    override per-invocation with ``--backend ollama`` to fall back to the
+    Ollama daemon.
+    """
+    import os
+
+    os.environ["DEVIN_LOCAL_DEFAULT_BACKEND"] = "layered"
+    app()
+
+
+def main_gui() -> None:
+    """Console-script entry point for `devin-local-gui` (no subcommand needed)."""
+    try:
+        from devin_local.gui.app import launch_gui
+    except ImportError as exc:
+        sys.stderr.write(
+            "GUI dependencies not installed. Install with:\n"
+            "    pip install devin-local[gui]\n"
+            f"(import error: {exc})\n"
+        )
+        sys.exit(2)
+    launch_gui()
 
 
 if __name__ == "__main__":
