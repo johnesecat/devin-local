@@ -17,7 +17,12 @@ pytest.importorskip("PySide6", reason="GUI tests require PySide6 ([gui] extra)")
 # Force offscreen *before* importing any Qt module.
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication  # noqa: E402
+try:
+    from PySide6.QtWidgets import QApplication  # noqa: E402
+except ImportError as exc:
+    # PySide6 wheels need libEGL/libxcb at runtime on Linux. CI environments
+    # without those system libs should skip these tests rather than error.
+    pytest.skip(f"PySide6 native libs not available: {exc}", allow_module_level=True)
 
 from devin_local.gui.app import MainWindow  # noqa: E402
 from devin_local.gui.widgets import ChatPane, Composer  # noqa: E402
