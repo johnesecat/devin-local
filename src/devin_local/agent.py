@@ -20,16 +20,22 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from devin_local.context_manager import ContextManager, make_default_context_manager
+from devin_local.inference.backend import (
+    BackendUnavailableError,
+    ChatChunk,
+    InferenceBackend,
+)
+from devin_local.inference.factory import build_backend
+from devin_local.inference.types import ChatMessage
 from devin_local.knowledge.store import KnowledgeStore
 from devin_local.mcp.client import MCPClientManager, load_mcp_servers
 from devin_local.ollama_client import (
-    ChatMessage,
     OllamaClient,
     OllamaError,
     parse_tool_call_arguments,
@@ -50,6 +56,8 @@ class AgentConfig:
 
     model: str = "llama3.1:8b"
     workspace: Path = field(default_factory=lambda: Path.cwd())
+    backend: str = "ollama"  # "ollama" | "layered" | "hf"
+    backend_options: dict[str, Any] = field(default_factory=dict)
     ollama_host: str = "http://127.0.0.1:11434"
     max_iterations: int = 20
     enable_obliteratus: bool = True
@@ -61,7 +69,9 @@ class AgentConfig:
     enable_skill_injection: bool = True
     temperature: float = 0.2
     session_path: Path | None = None
-    num_ctx: int | None = None  # override Ollama's context window
+    num_ctx: int | None = None  # override the backend's context window
+    keep_alive: str | int | None = None  # Ollama: keep model resident between turns
+    parallel_tool_calls: bool = True
     extra_options: dict[str, Any] = field(default_factory=dict)
 
 
@@ -75,21 +85,42 @@ class AgentTurn:
 
 
 ToolObserver = Callable[[str, dict[str, Any], ToolResult], None]
+StreamObserver = Callable[[ChatChunk], None]
 
 
 class Agent:
-    """Core devin-local agent."""
+    """Core devin-local agent.
+
+    Talks to any :class:`InferenceBackend`; the default is an Ollama backend
+    so existing callers don't need to change. Pass ``backend=...`` to inject
+    a custom one (e.g. the layered AirLLM backend or a scripted test backend).
+    """
 
     def __init__(
         self,
         config: AgentConfig,
         client: OllamaClient | None = None,
         registry: ToolRegistry | None = None,
+        backend: InferenceBackend | None = None,
     ) -> None:
         self.config = config
         self.workspace = config.workspace.resolve()
         self.workspace.mkdir(parents=True, exist_ok=True)
-        self.client = client or OllamaClient(host=config.ollama_host)
+        # Backend selection: explicit > legacy client > factory.
+        if backend is not None:
+            self.backend: InferenceBackend = backend
+        elif client is not None:
+            from devin_local.inference.ollama_backend import OllamaBackend
+
+            self.backend = OllamaBackend(host=config.ollama_host, client=client)
+        else:
+            opts = dict(config.backend_options)
+            if config.backend == "ollama":
+                opts.setdefault("host", config.ollama_host)
+            self.backend = build_backend(config.backend, **opts)
+        # Keep `self.client` for backwards compatibility with code that
+        # reaches into the agent for the raw Ollama client (tests, plugins).
+        self.client = client
         self.registry = registry or build_default_registry(
             self.workspace,
             enable_desktop=config.enable_desktop,
@@ -103,6 +134,7 @@ class Agent:
         self.messages: list[ChatMessage] = []
         self.session: SessionStore | None = None
         self._observers: list[ToolObserver] = []
+        self._stream_observers: list[StreamObserver] = []
         if config.session_path is not None:
             self.session = SessionStore.open(config.session_path)
             self.messages = list(self.session.messages)
@@ -110,11 +142,21 @@ class Agent:
             config.model, self._summarize
         )
         self._initialized = False
+        self._cached_system_prompt: str | None = None
+        self._cached_tool_names_snapshot: tuple[str, ...] | None = None
 
     # ---------- public API ----------
 
     def add_tool_observer(self, observer: ToolObserver) -> None:
         self._observers.append(observer)
+
+    def add_stream_observer(self, observer: StreamObserver) -> None:
+        """Subscribe to streaming chat chunks (token deltas + final message).
+
+        Used by the CLI and GUI to render tokens as they arrive. The agent
+        loop still owns message accumulation \u2014 observers are read-only.
+        """
+        self._stream_observers.append(observer)
 
     def initialize(self) -> None:
         """One-time setup: load plugins, connect MCP servers, build system prompt."""
@@ -128,19 +170,24 @@ class Agent:
         self._initialized = True
 
     def shutdown(self) -> None:
-        """Tear down MCP, terminals, and the HTTP client."""
+        """Tear down MCP, terminals, and the inference backend."""
         try:
             if self.mcp_manager is not None:
                 self.mcp_manager.shutdown()
         except Exception:  # noqa: BLE001
             log.exception("MCP shutdown failed")
         try:
-            self.client.close()
+            self.backend.close()
         except Exception:  # noqa: BLE001
-            log.exception("Ollama client close failed")
+            log.exception("inference backend close failed")
 
-    def handle_user(self, text: str) -> AgentTurn:
-        """Run one user → assistant turn (with any tool calls)."""
+    def handle_user(self, text: str, *, stream: bool = False) -> AgentTurn:
+        """Run one user → assistant turn (with any tool calls).
+
+        Set ``stream=True`` to receive incremental token deltas via any
+        registered stream observers. The returned :class:`AgentTurn` is
+        identical either way.
+        """
         self.initialize()
         user_msg = ChatMessage(role="user", content=text)
         self._append(user_msg)
@@ -151,8 +198,7 @@ class Agent:
 
         tool_results: list[tuple[str, ToolResult]] = []
         for iteration in range(self.config.max_iterations):
-            response = self._call_model()
-            assistant_msg = response.message
+            assistant_msg = self._call_model(stream=stream)
             self._append(assistant_msg)
 
             if not assistant_msg.tool_calls:
@@ -162,12 +208,20 @@ class Agent:
                     iterations=iteration + 1,
                 )
 
+            calls_to_dispatch: list[tuple[str, dict[str, Any]]] = []
             for call in assistant_msg.tool_calls:
                 fn = (call.get("function") or {}) if isinstance(call, dict) else {}
                 name = fn.get("name") or call.get("name") or ""
                 raw_args = fn.get("arguments", {})
                 arguments = parse_tool_call_arguments(raw_args)
-                result = self.registry.dispatch(name, arguments)
+                calls_to_dispatch.append((name, arguments))
+
+            if self.config.parallel_tool_calls and len(calls_to_dispatch) > 1:
+                results = self.registry.dispatch_many(calls_to_dispatch)
+            else:
+                results = [self.registry.dispatch(n, a) for n, a in calls_to_dispatch]
+
+            for (name, arguments), result in zip(calls_to_dispatch, results, strict=False):
                 tool_results.append((name, result))
                 for observer in self._observers:
                     try:
@@ -198,39 +252,114 @@ class Agent:
         if self.session is not None:
             self.session.append(message)
 
-    def _call_model(self):  # noqa: ANN202
+    def _call_model(self, *, stream: bool = False) -> ChatMessage:
         options: dict[str, Any] = {"temperature": self.config.temperature}
         if self.config.num_ctx is not None:
             options["num_ctx"] = self.config.num_ctx
         options.update(self.config.extra_options)
+        tools = self.registry.to_ollama_schemas()
         try:
-            return self.client.chat(
+            if stream:
+                final: ChatMessage | None = None
+                for chunk in self.backend.stream(
+                    model=self.config.model,
+                    messages=self.messages,
+                    tools=tools,
+                    options=options,
+                    keep_alive=self.config.keep_alive,
+                ):
+                    for obs in self._stream_observers:
+                        try:
+                            obs(chunk)
+                        except Exception:  # noqa: BLE001
+                            log.exception("stream observer raised")
+                    if chunk.done and chunk.message is not None:
+                        final = chunk.message
+                if final is None:
+                    return ChatMessage(role="assistant", content="")
+                return final
+            response = self.backend.chat(
                 model=self.config.model,
                 messages=self.messages,
-                tools=self.registry.to_ollama_schemas(),
+                tools=tools,
                 options=options,
+                keep_alive=self.config.keep_alive,
             )
+            return response.message
+        except BackendUnavailableError:
+            raise
         except OllamaError:
             raise
 
+    def stream_user(self, text: str) -> Iterator[ChatChunk]:
+        """Generator variant of `handle_user` that yields chunks as they arrive.
+
+        The agent's turn runs on a background thread; chunks are handed off to
+        the calling thread through a thread-safe queue so callers see token
+        deltas immediately (not buffered until the turn completes). After the
+        generator is exhausted, ``self.messages`` holds the full updated
+        transcript and any tool calls have been dispatched.
+        """
+        import queue
+        import threading
+
+        sentinel = object()
+        q: queue.Queue[Any] = queue.Queue()
+
+        def _collect(chunk: ChatChunk) -> None:
+            q.put(chunk)
+
+        def _run() -> None:
+            try:
+                self.handle_user(text, stream=True)
+            except BaseException as exc:  # noqa: BLE001
+                q.put(exc)
+            finally:
+                q.put(sentinel)
+
+        self.add_stream_observer(_collect)
+        worker = threading.Thread(target=_run, daemon=True, name="agent-stream")
+        worker.start()
+        try:
+            while True:
+                item = q.get()
+                if item is sentinel:
+                    break
+                if isinstance(item, BaseException):
+                    raise item
+                yield item
+        finally:
+            import contextlib as _ctx
+
+            with _ctx.suppress(ValueError):
+                self._stream_observers.remove(_collect)
+            worker.join(timeout=5.0)
+
     def _summarize(self, text: str, max_tokens: int) -> str:
         try:
-            return self.client.summarize(self.config.model, text, max_tokens=max_tokens)
-        except OllamaError as exc:
+            return self.backend.summarize(self.config.model, text, max_tokens=max_tokens)
+        except (BackendUnavailableError, OllamaError) as exc:
             return f"(summary failed: {exc})"
 
     def _ensure_system_prompt(self) -> None:
         if self.messages and self.messages[0].role == "system":
             return
-        ctx = PromptContext(
-            workspace=self.workspace,
-            model=self.config.model,
-            tool_names=self.registry.names(),
-            enable_obliteratus=self.config.enable_obliteratus,
-            extra_sections=self.system_prompt_sections,
-        )
-        prompt = build_system_prompt(ctx)
-        self.messages.insert(0, ChatMessage(role="system", content=prompt))
+        # Cache the system prompt: tools and skills are stable across turns,
+        # so rebuilding the prompt every turn just wastes CPU and (worse)
+        # changes the prompt-cache hash on the backend, defeating Ollama's
+        # KV cache. Only rebuild when the tool set changes.
+        tool_names = tuple(self.registry.names())
+        if self._cached_system_prompt is None or self._cached_tool_names_snapshot != tool_names:
+            ctx = PromptContext(
+                workspace=self.workspace,
+                model=self.config.model,
+                tool_names=list(tool_names),
+                enable_obliteratus=self.config.enable_obliteratus,
+                extra_sections=self.system_prompt_sections,
+            )
+            self._cached_system_prompt = build_system_prompt(ctx)
+            self._cached_tool_names_snapshot = tool_names
+        self.messages.insert(0, ChatMessage(role="system", content=self._cached_system_prompt))
         if self.session is not None:
             self.session.replace_all(self.messages)
 

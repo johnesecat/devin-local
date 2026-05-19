@@ -38,12 +38,35 @@ dependencies = [
 desktop = ["pyautogui>=0.9.54", "pillow>=10.0"]
 browser = ["playwright>=1.42", "beautifulsoup4>=4.12"]
 mcp = ["mcp>=1.0"]
+gui = [
+    "PySide6>=6.6",
+    "pillow>=10.0",
+]
+layered = [
+    # AirLLM does layer-by-layer quantized loading on top of these libs.
+    "airllm>=2.11",
+    "torch>=2.2",
+    "transformers>=4.41",
+    "accelerate>=0.30",
+    "safetensors>=0.4",
+    "sentencepiece>=0.2",
+]
+hf = [
+    "torch>=2.2",
+    "transformers>=4.41",
+    "accelerate>=0.30",
+    "safetensors>=0.4",
+    "sentencepiece>=0.2",
+    # bitsandbytes 0.43+ added CPU support; older versions need CUDA.
+    "bitsandbytes>=0.43; platform_system != 'Darwin'",
+]
 all = [
     "pyautogui>=0.9.54",
     "pillow>=10.0",
     "playwright>=1.42",
     "beautifulsoup4>=4.12",
     "mcp>=1.0",
+    "PySide6>=6.6",
 ]
 dev = [
     "pytest>=8.0",
@@ -54,6 +77,13 @@ dev = [
 
 [project.scripts]
 devin-local = "devin_local.cli:main"
+devin-local-layered = "devin_local.cli:main_layered"
+devin-local-gui = "devin_local.cli:main_gui"
+
+[project.gui-scripts]
+# Windows: invoking these without a console window (so launching from the
+# Start Menu doesn't spawn a black box).
+devin-local-gui-app = "devin_local.cli:main_gui"
 
 [project.urls]
 Homepage = "https://github.com/johnesecat/devin-local"

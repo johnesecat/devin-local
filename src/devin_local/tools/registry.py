@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -74,6 +75,28 @@ class ToolRegistry:
             return error_result(str(exc))
         except Exception as exc:  # noqa: BLE001 - we never want a tool to crash the loop
             return error_result(f"Unhandled error in tool {name}: {exc!r}")
+
+    def dispatch_many(
+        self,
+        calls: list[tuple[str, dict[str, Any]]],
+        max_workers: int = 4,
+    ) -> list[ToolResult]:
+        """Dispatch multiple tool calls concurrently, preserving order.
+
+        When the model emits several tool_calls in one turn (e.g. read three
+        files at once), running them serially wastes wall-clock time. Each
+        call still goes through the same `dispatch()` path \u2014 same error
+        handling, same observers \u2014 just in a worker thread.
+        """
+        if not calls:
+            return []
+        if len(calls) == 1:
+            name, arguments = calls[0]
+            return [self.dispatch(name, arguments)]
+        workers = min(max_workers, len(calls))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="tool") as pool:
+            futures = [pool.submit(self.dispatch, name, arguments) for name, arguments in calls]
+            return [f.result() for f in futures]
 
 
 def build_default_registry(

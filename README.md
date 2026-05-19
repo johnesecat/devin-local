@@ -1,13 +1,23 @@
 # devin-local
 
-A **100% local, free, and private** autonomous AI software-engineer agent
-powered by [Ollama](https://ollama.com). No API keys. No logins. No
-subscriptions. Your code stays on your machine.
+A **100% local, free, and private** autonomous AI software-engineer agent.
+No API keys. No logins. No subscriptions. Your code stays on your machine.
+
+Three pluggable inference backends, one agent:
+
+- **Ollama** (default) — fast, daemon-based, recommended for everyday use.
+- **Layered (AirLLM)** — layer-by-layer quantized loading so 70B-class
+  models fit on 8 GB of RAM. Slow per token, but unlocks big models on
+  laptops.
+- **HF Transformers** — HuggingFace + `accelerate` + optional 4-bit
+  `bitsandbytes`. Good middle ground when you have a small GPU.
 
 devin-local borrows ideas from Devin and Claude Code: a tool-using agent
 loop with file, shell, browser, and desktop primitives — plus plugins, MCP
-servers, knowledge upload, skills, and model-aware context compression so
-sessions can run indefinitely without blowing the context window.
+servers, knowledge upload, skills, model-aware context compression, and
+streaming + parallel tool dispatch so sessions feel snappy.
+
+Ships both as a terminal CLI and a native **PySide6 desktop app**.
 
 > **Built primarily for Windows 10/11.** Also works on Linux and macOS.
 
@@ -67,8 +77,19 @@ python -m venv .venv
 pip install -e ".[all]"
 ```
 
-The `[all]` extra installs optional desktop, browser, and MCP support.
-Use `pip install -e .` if you want a minimal install.
+The `[all]` extra installs desktop, browser, MCP, and GUI support. Use
+`pip install -e .` for a minimal install.
+
+Optional extras (install only what you need):
+
+| Extra       | What it pulls in                                                |
+|-------------|------------------------------------------------------------------|
+| `[gui]`     | PySide6 — the desktop application.                              |
+| `[layered]` | AirLLM + torch + transformers — layer-by-layer quantized loading. |
+| `[hf]`      | torch + transformers + bitsandbytes — HF backend with 4-/8-bit. |
+| `[desktop]` | pyautogui + pillow — screenshot / mouse / keyboard tools.       |
+| `[browser]` | playwright + bs4 — web fetch + search.                          |
+| `[mcp]`     | mcp — connect to Model Context Protocol servers.                |
 
 ### 3. Run a health check
 
@@ -76,8 +97,67 @@ Use `pip install -e .` if you want a minimal install.
 devin-local doctor
 ```
 
-You should see your Python version, the Ollama host responding, and a list
-of installed models.
+You should see your Python version, every backend's status (ollama daemon,
+layered, hf), and a list of installed Ollama models.
+
+List just the backends:
+
+```powershell
+devin-local backends
+```
+
+### 4. Launch the desktop app
+
+```powershell
+pip install -e ".[gui]"
+devin-local-gui
+```
+
+The app has a sidebar (sessions), main chat pane (streaming token render
++ collapsible tool-call cards), inspector (workspace file tree, backend
+selector, model picker), and a composer with **Ctrl+Enter to send**.
+
+On Windows you can also launch `devin-local-gui-app` (no console window),
+useful for Start Menu / desktop shortcuts.
+
+---
+
+## Choosing a backend
+
+| Backend  | Best for                                        | RAM      | Speed  | Setup                          |
+|----------|-------------------------------------------------|----------|--------|--------------------------------|
+| `ollama` | Everyday work, agent loops, fast iteration.     | ~8 GB    | Fast   | Install Ollama, `ollama pull`. |
+| `layered`| Running 70B+ models on ≤8 GB of RAM.            | ~8 GB    | Slow   | `pip install ".[layered]"`     |
+| `hf`     | Small GPU + 4-bit quantization, or pure CPU.    | ~16 GB+  | Medium | `pip install ".[hf]"`          |
+
+**Two launcher prefixes** so you can switch without typing flags every time:
+
+```powershell
+devin-local         run "..."      # Ollama (default)
+devin-local-layered run "..."      # Layered / AirLLM
+```
+
+The `--backend` flag still works on either entry point if you want to
+override per invocation:
+
+```powershell
+devin-local         run --backend layered --model-path Qwen/Qwen2.5-7B-Instruct "…"
+devin-local-layered run --backend ollama  --model llama3.1:8b "…"
+devin-local         run --backend hf --model-path gpt2 --device-map cpu "hello"
+```
+
+### Layered (AirLLM) tradeoffs
+
+The layered backend loads **one transformer layer at a time**, runs it,
+frees it, and moves on. That's how it fits a 70B model in 8 GB of RAM —
+but also why it's slow per token (often tens of seconds per token on
+CPU; faster on GPU). Use it when model size matters more than latency.
+
+### Windows notes for `bitsandbytes`
+
+`bitsandbytes >= 0.43` ships CPU kernels and works on Windows out of the
+box. Earlier versions require CUDA. If you hit `OSError: cannot find
+libbitsandbytes_*.dll`, upgrade with `pip install -U bitsandbytes`.
 
 ### 4. Try the verification task
 

@@ -8,30 +8,18 @@ chat API is documented here: https://github.com/ollama/ollama/blob/main/docs/api
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
 
+from devin_local.inference.types import ChatMessage
+
 DEFAULT_HOST = "http://127.0.0.1:11434"
 
-
-@dataclass
-class ChatMessage:
-    """A single message in an Ollama chat conversation."""
-
-    role: str  # "system" | "user" | "assistant" | "tool"
-    content: str = ""
-    tool_calls: list[dict[str, Any]] = field(default_factory=list)
-    name: str | None = None  # For tool responses: the tool name.
-
-    def to_dict(self) -> dict[str, Any]:
-        payload: dict[str, Any] = {"role": self.role, "content": self.content}
-        if self.tool_calls:
-            payload["tool_calls"] = self.tool_calls
-        if self.name:
-            payload["name"] = self.name
-        return payload
+# Re-exported so existing imports `from devin_local.ollama_client import ChatMessage` keep working.
+__all_message__ = ChatMessage  # noqa: F841  (suppress unused; kept for clarity)
 
 
 @dataclass
@@ -44,6 +32,16 @@ class ChatResponse:
     prompt_eval_count: int = 0
     total_duration_ns: int = 0
     done: bool = True
+
+
+@dataclass
+class StreamChunk:
+    """One incremental piece of a streamed `/api/chat?stream=true` response."""
+
+    delta: str = ""
+    done: bool = False
+    message: ChatMessage | None = None
+    raw: dict[str, Any] = field(default_factory=dict)
 
 
 class OllamaError(RuntimeError):
@@ -145,6 +143,72 @@ class OllamaClient:
             total_duration_ns=int(data.get("total_duration", 0) or 0),
             done=bool(data.get("done", True)),
         )
+
+    def chat_stream(
+        self,
+        model: str,
+        messages: list[ChatMessage],
+        tools: list[dict[str, Any]] | None = None,
+        options: dict[str, Any] | None = None,
+        format: str | None = None,
+        keep_alive: str | int | None = None,
+    ) -> Iterator[StreamChunk]:
+        """Stream a chat completion from Ollama as NDJSON.
+
+        Yields one `StreamChunk` per NDJSON record. The final chunk has
+        `done=True` and carries the accumulated `ChatMessage` (with structured
+        `tool_calls` if the model emitted any).
+        """
+        body: dict[str, Any] = {
+            "model": model,
+            "messages": [m.to_dict() for m in messages],
+            "stream": True,
+        }
+        if tools:
+            body["tools"] = tools
+        if options:
+            body["options"] = options
+        if format:
+            body["format"] = format
+        if keep_alive is not None:
+            body["keep_alive"] = keep_alive
+
+        accumulated_content: list[str] = []
+        accumulated_tool_calls: list[dict[str, Any]] = []
+
+        try:
+            with self._client.stream(
+                "POST", f"{self.host}/api/chat", json=body, timeout=self.timeout
+            ) as resp:
+                if resp.status_code != 200:
+                    body_text = resp.read().decode("utf-8", errors="replace")[:500]
+                    raise OllamaError(f"Ollama returned HTTP {resp.status_code}: {body_text}")
+                for line in resp.iter_lines():
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    msg_data = record.get("message", {}) or {}
+                    delta = msg_data.get("content", "") or ""
+                    if delta:
+                        accumulated_content.append(delta)
+                    chunk_tool_calls = msg_data.get("tool_calls") or []
+                    if chunk_tool_calls:
+                        accumulated_tool_calls.extend(chunk_tool_calls)
+                    done = bool(record.get("done", False))
+                    if done:
+                        final = ChatMessage(
+                            role="assistant",
+                            content="".join(accumulated_content),
+                            tool_calls=accumulated_tool_calls,
+                        )
+                        yield StreamChunk(delta=delta, done=True, message=final, raw=record)
+                    else:
+                        yield StreamChunk(delta=delta, done=False, raw=record)
+        except httpx.HTTPError as exc:
+            raise OllamaError(f"Ollama stream failed: {exc}") from exc
 
     def summarize(
         self,
