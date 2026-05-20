@@ -545,9 +545,10 @@ class ChatPane(QScrollArea):
 
 
 class Composer(QWidget):
-    """Multi-line input box + send button."""
+    """Multi-line input box + send button (with a Stop button while busy)."""
 
     submitted = Signal(str)
+    cancel_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -563,8 +564,15 @@ class Composer(QWidget):
         self._send.setObjectName("Primary")
         self._send.setMinimumWidth(96)
         self._send.clicked.connect(self._emit)
+        self._stop = QPushButton("Stop")
+        self._stop.setObjectName("Stop")
+        self._stop.setMinimumWidth(72)
+        self._stop.setVisible(False)
+        self._stop.clicked.connect(self.cancel_requested)
         layout.addWidget(self._input, 1)
+        # Stack the Send/Stop on the same row; Stop replaces Send while busy.
         layout.addWidget(self._send, 0, Qt.AlignmentFlag.AlignBottom)
+        layout.addWidget(self._stop, 0, Qt.AlignmentFlag.AlignBottom)
 
     def keyPressEvent(self, event) -> None:  # noqa: D401, N802
         if (
@@ -578,6 +586,8 @@ class Composer(QWidget):
     def set_busy(self, busy: bool) -> None:
         self._send.setEnabled(not busy)
         self._send.setText("\u2026" if busy else "Send")
+        self._send.setVisible(not busy)
+        self._stop.setVisible(busy)
 
     def _emit(self) -> None:
         text = self._input.toPlainText().strip()

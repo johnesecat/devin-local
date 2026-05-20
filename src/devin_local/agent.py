@@ -204,6 +204,12 @@ class Agent:
         # Full cache key: (tool_names, knowledge_snapshot, skill_snapshot).
         # Invalidates the cached system prompt whenever any of those change.
         self._cached_prompt_cache_key: tuple[Any, ...] | None = None
+        # Cancellation flag for the in-flight turn. Set by ``request_cancel``;
+        # consumed by ``handle_user``. Threading.Event is process-safe and
+        # cheap to check between iterations.
+        import threading as _threading
+
+        self._cancel_event = _threading.Event()
 
     # ---------- public API ----------
 
@@ -343,6 +349,29 @@ class Agent:
         except Exception:  # noqa: BLE001
             log.exception("inference backend close failed")
 
+    def request_cancel(self) -> None:
+        """Signal that the in-flight ``handle_user`` should abort.
+
+        Two-stage cancellation:
+        1. Sets a flag the agent loop checks between iterations and tool
+           dispatches, so an in-progress turn returns cleanly with a
+           "cancelled" final message rather than crashing.
+        2. Closes the inference backend's HTTP connection so an in-flight
+           streaming response is torn down immediately (otherwise a slow
+           CPU prefill blocks the cancel by minutes).
+        """
+        self._cancel_event.set()
+        try:
+            self.backend.close()
+        except Exception:  # noqa: BLE001
+            log.exception("backend close during cancel failed")
+
+    def reset_cancel(self) -> None:
+        self._cancel_event.clear()
+
+    def cancel_requested(self) -> bool:
+        return self._cancel_event.is_set()
+
     def handle_user(self, text: str, *, stream: bool = False) -> AgentTurn:
         """Run one user → assistant turn (with any tool calls).
 
@@ -350,6 +379,7 @@ class Agent:
         registered stream observers. The returned :class:`AgentTurn` is
         identical either way.
         """
+        self.reset_cancel()
         self.initialize()
         user_msg = ChatMessage(role="user", content=text)
         self._append(user_msg)
@@ -361,7 +391,28 @@ class Agent:
         tool_results: list[tuple[str, ToolResult]] = []
         self.plan = Plan()
         for iteration in range(self.config.max_iterations):
-            assistant_msg = self._call_model(stream=stream)
+            if self._cancel_event.is_set():
+                return AgentTurn(
+                    assistant_text="(cancelled by operator)",
+                    tool_results=tool_results,
+                    iterations=iteration,
+                )
+            try:
+                assistant_msg = self._call_model(stream=stream)
+            except Exception as exc:  # noqa: BLE001
+                if self._cancel_event.is_set():
+                    return AgentTurn(
+                        assistant_text="(cancelled by operator)",
+                        tool_results=tool_results,
+                        iterations=iteration,
+                    )
+                raise exc
+            if self._cancel_event.is_set():
+                return AgentTurn(
+                    assistant_text="(cancelled by operator)",
+                    tool_results=tool_results,
+                    iterations=iteration + 1,
+                )
             self._append(assistant_msg)
             self._maybe_update_plan(assistant_msg.content)
 

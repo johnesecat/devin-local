@@ -37,7 +37,8 @@ class AgentWorker(QObject):
     plan_updated = Signal(object)  # Plan
     turn_finished = Signal(str, int, float)
     error = Signal(str)
-    state_changed = Signal(str)  # "idle" | "thinking" | "tool" | "error"
+    state_changed = Signal(str)  # "idle" | "thinking" | "tool" | "error" | "cancelled"
+    cancelled = Signal()
 
     def __init__(self, agent: Agent) -> None:
         super().__init__()
@@ -95,6 +96,20 @@ class AgentWorker(QObject):
                 self.agent._tool_start_observers.remove(_on_tool_start)
             with contextlib.suppress(ValueError):
                 self.agent._plan_observers.remove(_on_plan)
+
+    @Slot()
+    def request_cancel(self) -> None:
+        """Cancel the in-flight turn.
+
+        Safe to call from any thread — ``Agent.request_cancel`` sets a
+        ``threading.Event`` and closes the inference HTTP connection, which
+        unblocks a slow CPU prefill immediately. ``submit`` then returns
+        through its normal "cancelled" path.
+        """
+        with contextlib.suppress(Exception):
+            self.agent.request_cancel()
+        self.state_changed.emit("cancelled")
+        self.cancelled.emit()
 
     @Slot()
     def shutdown(self) -> None:

@@ -403,7 +403,14 @@ class MainWindow(QMainWindow):
         worker.turn_finished.connect(self._on_turn_finished)
         worker.error.connect(self._on_error)
         worker.state_changed.connect(self._on_state_changed)
+        worker.cancelled.connect(self._on_cancelled)
         self.request_submit.connect(worker.submit)
+        # Direct connection (Qt.DirectConnection) so cancel reaches the
+        # worker thread immediately rather than queueing behind the in-
+        # flight slot. Agent.request_cancel is thread-safe.
+        self._composer.cancel_requested.connect(
+            worker.request_cancel, Qt.ConnectionType.DirectConnection
+        )
         thread = run_in_worker_thread(self, worker)
         self._agent = agent
         self._worker = worker
@@ -478,6 +485,12 @@ class MainWindow(QMainWindow):
 
     def _on_state_changed(self, state: str) -> None:
         self._status_state.setText(state)
+
+    def _on_cancelled(self) -> None:
+        """Wired to AgentWorker.cancelled: surface in chat + reset composer."""
+        self._chat.add_system_notice("\u23f9  Turn cancelled by operator.")
+        self._composer.set_busy(False)
+        self._status_state.setText("cancelled")
 
     def _on_backend_changed(self, _index: int) -> None:
         chosen = self._backend_combo.currentData()
