@@ -307,11 +307,16 @@ class MainWindow(QMainWindow):
         self._status_state = QLabel("idle")
         self._status_backend = QLabel(f"backend: {self._backend_name}")
         self._status_model = QLabel(f"model: {self._model_name}")
+        # Live progress: blank when idle; shows "prefill 4.2s" or "gen
+        # 42 tok @ 18.7 tok/s" while a turn is in flight.
+        self._status_progress = QLabel("")
+        self._status_progress.setObjectName("Progress")
         self._status_workspace = QLabel(f"workspace: {self.workspace}")
         self._status_workspace.setObjectName("Muted")
         layout.addWidget(self._status_state)
         layout.addWidget(self._status_backend)
         layout.addWidget(self._status_model)
+        layout.addWidget(self._status_progress)
         layout.addStretch(1)
         layout.addWidget(self._status_workspace)
         return bar
@@ -382,6 +387,7 @@ class MainWindow(QMainWindow):
                 if info and info.verbose_prompt is not None
                 else self._global_settings.general.verbose_prompt
             ),
+            tools_schema_mode=("full" if self._global_settings.general.full_toolbelt else "smart"),
             max_iterations=(info.max_iterations or 20) if info else 20,
             temperature=(info.temperature if info and info.temperature is not None else 0.2),
             session_path=(self._session_manager.transcript_path(info.id) if info else None),
@@ -404,6 +410,7 @@ class MainWindow(QMainWindow):
         worker.error.connect(self._on_error)
         worker.state_changed.connect(self._on_state_changed)
         worker.cancelled.connect(self._on_cancelled)
+        worker.progress_changed.connect(self._on_progress_changed)
         self.request_submit.connect(worker.submit)
         # Direct connection (Qt.DirectConnection) so cancel reaches the
         # worker thread immediately rather than queueing behind the in-
@@ -491,6 +498,30 @@ class MainWindow(QMainWindow):
         self._chat.add_system_notice("\u23f9  Turn cancelled by operator.")
         self._composer.set_busy(False)
         self._status_state.setText("cancelled")
+        self._status_progress.setText("")
+
+    def _on_progress_changed(self, stage: str, info: dict) -> None:
+        """Render the live prefill/generate counter into the status bar.
+
+        ``stage``:
+          - ``prefill``  → "prefill 4.2s" while we wait for the first token
+          - ``generate`` → "gen 42 tok @ 18.7 tok/s"
+          - ``done``     → "42 tok in 5.1s @ 8.3 tok/s" (sticks until next turn)
+          - ``idle``     → clear
+        """
+        if stage == "prefill":
+            self._status_progress.setText(f"prefill {info.get('elapsed_s', 0.0):.1f}s")
+        elif stage == "generate":
+            self._status_progress.setText(
+                f"gen {info.get('tokens', 0)} tok @ {info.get('tok_s', 0.0):.1f} tok/s"
+            )
+        elif stage == "done":
+            tok = info.get("completion_tokens", 0)
+            elapsed = info.get("elapsed_s", 0.0)
+            tok_s = (tok / elapsed) if elapsed > 0 else 0.0
+            self._status_progress.setText(f"{tok} tok in {elapsed:.1f}s @ {tok_s:.1f} tok/s")
+        else:
+            self._status_progress.setText("")
 
     def _on_backend_changed(self, _index: int) -> None:
         chosen = self._backend_combo.currentData()

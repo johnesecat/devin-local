@@ -82,6 +82,13 @@ class GeneralSettings:
     # (~13 KB). When False (default), use the slim ~3 KB prompt — faster
     # local inference, same identity / honesty / planning rules.
     verbose_prompt: bool = False
+    # When True, ship every registered tool to the model on every turn
+    # (the "full toolbelt"). When False (default), the agent picks a
+    # relevant subset based on keyword overlap with the user's message,
+    # which can shave kilobytes off prefill cost on CPU. The "always-
+    # include" set (read/write/edit/list/shell/knowledge) stays resident
+    # in both modes so foundational tools never round-trip.
+    full_toolbelt: bool = False
 
 
 @dataclass

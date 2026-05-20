@@ -160,6 +160,19 @@ class _GeneralTab(QWidget):
         )
         form.addRow("", self.verbose_prompt)
 
+        self.full_toolbelt = QCheckBox(
+            "Full toolbelt (ship every registered tool to the model each turn)"
+        )
+        self.full_toolbelt.setChecked(settings.general.full_toolbelt)
+        self.full_toolbelt.setToolTip(
+            "When off (default), devin-local picks a relevant subset of tools "
+            "for each turn based on what your message looks like — saving "
+            "prefill cost on CPU. Core tools (read/write/edit/list/shell/"
+            "knowledge) are always shipped regardless. Turn this on if you want "
+            "every tool's JSON-Schema in front of the model every turn."
+        )
+        form.addRow("", self.full_toolbelt)
+
     def _on_browse_workspace(self) -> None:
         chosen = QFileDialog.getExistingDirectory(self, "Choose workspace")
         if chosen:
@@ -196,6 +209,7 @@ class _GeneralTab(QWidget):
             enable_obliteratus=self.obliteratus.isChecked(),
             enable_planning=self.planning.isChecked(),
             verbose_prompt=self.verbose_prompt.isChecked(),
+            full_toolbelt=self.full_toolbelt.isChecked(),
         )
 
 

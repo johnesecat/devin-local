@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -50,6 +51,19 @@ from devin_local.tools.base import ToolResult
 from devin_local.tools.registry import ToolRegistry, build_default_registry
 
 log = logging.getLogger(__name__)
+
+_WORD_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9_]+")
+
+
+def _tokenize_for_match(text: str) -> list[str]:
+    """Lowercase word tokens for keyword-overlap matching.
+
+    Used by ``Agent._select_relevant_tools``. Drops short/common tokens
+    so they don't trigger false positives on every tool description.
+    """
+    if not text:
+        return []
+    return [w.lower() for w in _WORD_RE.findall(text)]
 
 
 @dataclass
@@ -106,6 +120,29 @@ class AgentConfig:
     num_ctx: int | None = None  # override the backend's context window
     keep_alive: str | int | None = None  # Ollama: keep model resident between turns
     parallel_tool_calls: bool = True
+    # How much of the tool schema to ship to the model.
+    #
+    #   "full"   — every registered tool, regardless of likely relevance.
+    #             Power-user default; bigger prompt, more flexibility.
+    #   "smart"  — ship core tools (read/write/shell) always, plus any
+    #             tools whose names/descriptions match keywords in the
+    #             most recent user message. Cuts prefill cost on CPU
+    #             without sacrificing capability — if the model needs a
+    #             tool we didn't ship, the next turn auto-includes it.
+    tools_schema_mode: str = "smart"
+    # Tool names that are ALWAYS included regardless of selection mode.
+    # The file + shell + knowledge tools are foundational; almost every
+    # turn touches at least one of them, so keeping them resident saves
+    # the round-trip cost of "fetch the tool you needed and re-prompt".
+    always_include_tools: tuple[str, ...] = (
+        "read_file",
+        "write_file",
+        "edit_file",
+        "list_directory",
+        "shell_exec",
+        "knowledge_search",
+        "knowledge_read",
+    )
     extra_options: dict[str, Any] = field(default_factory=dict)
 
 
@@ -497,12 +534,54 @@ class Agent:
         if self.session is not None:
             self.session.append(message)
 
+    def _select_relevant_tools(self, schemas: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Pick a relevant subset of ``schemas`` for the current turn.
+
+        Honest, keyword-overlap based selection — no model call, no
+        embedding. Saves CPU prefill cost without requiring the user to
+        babysit which tools the agent should use.
+
+        Returns ``schemas`` unchanged when:
+        - ``tools_schema_mode != "smart"`` (operator opted into full toolbelt)
+        - there is no user message yet
+        - there are fewer than 6 schemas (no win from filtering)
+        """
+        if self.config.tools_schema_mode != "smart":
+            return schemas
+        if not schemas or len(schemas) < 6:
+            return schemas
+        latest_user_text = ""
+        for msg in reversed(self.messages):
+            if msg.role == "user" and msg.content:
+                latest_user_text = msg.content
+                break
+        if not latest_user_text:
+            return schemas
+        user_words = {w for w in _tokenize_for_match(latest_user_text) if len(w) >= 3}
+        if not user_words:
+            return schemas
+        always = set(self.config.always_include_tools)
+        chosen: list[dict[str, Any]] = []
+        for schema in schemas:
+            fn = schema.get("function") or {}
+            name = fn.get("name") or schema.get("name") or ""
+            if name in always:
+                chosen.append(schema)
+                continue
+            description = fn.get("description") or ""
+            tool_words = set(_tokenize_for_match(name + " " + description))
+            if user_words & tool_words:
+                chosen.append(schema)
+        if not chosen:
+            return schemas
+        return chosen
+
     def _call_model(self, *, stream: bool = False) -> ChatMessage:
         options: dict[str, Any] = {"temperature": self.config.temperature}
         if self.config.num_ctx is not None:
             options["num_ctx"] = self.config.num_ctx
         options.update(self.config.extra_options)
-        tools = self.registry.to_ollama_schemas()
+        tools = self._select_relevant_tools(self.registry.to_ollama_schemas())
         try:
             if stream:
                 final: ChatMessage | None = None

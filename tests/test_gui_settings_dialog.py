@@ -54,6 +54,7 @@ def test_general_tab_round_trips_through_settings_load() -> None:
     dlg.general_tab.default_backend.setCurrentText("layered")
     dlg.general_tab.parallel.setChecked(False)
     dlg.general_tab.obliteratus.setChecked(False)
+    dlg.general_tab.full_toolbelt.setChecked(True)
     dlg._on_save()
 
     loaded = Settings.load()
@@ -61,6 +62,7 @@ def test_general_tab_round_trips_through_settings_load() -> None:
     assert loaded.general.default_backend == "layered"
     assert loaded.general.parallel_tool_calls is False
     assert loaded.general.enable_obliteratus is False
+    assert loaded.general.full_toolbelt is True
 
 
 def test_mcp_tab_add_and_remove_persists() -> None:

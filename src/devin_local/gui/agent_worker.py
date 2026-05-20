@@ -39,6 +39,14 @@ class AgentWorker(QObject):
     error = Signal(str)
     state_changed = Signal(str)  # "idle" | "thinking" | "tool" | "error" | "cancelled"
     cancelled = Signal()
+    # Live progress for the in-flight turn. ``stage`` is one of:
+    #   "prefill"  — request sent, no tokens yet. info = {"elapsed_s": float}
+    #   "generate" — tokens flowing. info = {"tokens": int, "tok_s": float,
+    #                "elapsed_s": float}
+    #   "done"     — turn complete. info = {"prompt_tokens": int,
+    #                "completion_tokens": int, "elapsed_s": float}
+    #   "idle"     — composer reset, clear any progress text.
+    progress_changed = Signal(str, dict)
 
     def __init__(self, agent: Agent) -> None:
         super().__init__()
@@ -59,10 +67,42 @@ class AgentWorker(QObject):
         if not user_text.strip():
             return
         self.state_changed.emit("thinking")
+        # Emit a "prefill 0.0s" right away so the GUI status bar flips out
+        # of "idle" the instant the operator hits Send — even if the model
+        # takes minutes before the first token, the operator sees we're
+        # waiting on it. Subsequent updates come from _on_chunk as tokens
+        # actually arrive (which is when we can compute real tok/s).
+        self.progress_changed.emit("prefill", {"elapsed_s": 0.0})
+
+        progress: dict[str, Any] = {
+            "start": time.monotonic(),
+            "first_token_at": None,
+            "tokens": 0,
+            "last_emit": 0.0,
+        }
 
         def _on_chunk(chunk: ChatChunk) -> None:
             if not chunk.done and chunk.delta:
+                now = time.monotonic()
+                if progress["first_token_at"] is None:
+                    progress["first_token_at"] = now
+                progress["tokens"] += 1
                 self.token.emit(chunk.delta)
+                # Throttle generate-stage emissions to ~5/s; tokens are
+                # cheap to emit but recomputing tok/s every chunk is
+                # wasteful on UI repaint.
+                if now - progress["last_emit"] >= 0.2:
+                    progress["last_emit"] = now
+                    generated_for = max(1e-3, now - progress["first_token_at"])
+                    tok_s = progress["tokens"] / generated_for
+                    self.progress_changed.emit(
+                        "generate",
+                        {
+                            "tokens": progress["tokens"],
+                            "tok_s": tok_s,
+                            "elapsed_s": now - progress["start"],
+                        },
+                    )
 
         def _on_tool(name: str, args: dict[str, Any], result: ToolResult) -> None:
             self.tool_finished.emit(name, args, result)
@@ -79,15 +119,37 @@ class AgentWorker(QObject):
         self.agent.add_tool_start_observer(_on_tool_start)
         self.agent.add_plan_observer(_on_plan)
         try:
-            start = time.monotonic()
+            start = progress["start"]
             turn = self.agent.handle_user(user_text, stream=self._stream_enabled)
             elapsed = time.monotonic() - start
+            # Always emit a final "generate" snapshot so the status bar
+            # shows a real tok/s ratio (the throttled in-stream snapshot
+            # may be slightly stale).
+            if progress["tokens"] > 0 and progress["first_token_at"] is not None:
+                generated_for = max(1e-3, time.monotonic() - progress["first_token_at"])
+                self.progress_changed.emit(
+                    "generate",
+                    {
+                        "tokens": progress["tokens"],
+                        "tok_s": progress["tokens"] / generated_for,
+                        "elapsed_s": elapsed,
+                    },
+                )
+            self.progress_changed.emit(
+                "done",
+                {
+                    "prompt_tokens": 0,
+                    "completion_tokens": progress["tokens"],
+                    "elapsed_s": elapsed,
+                },
+            )
             self.turn_finished.emit(turn.assistant_text, len(turn.tool_results), elapsed)
             self.state_changed.emit("idle")
         except Exception as exc:  # noqa: BLE001 - surface to UI, don't crash thread
             self.error.emit(f"{type(exc).__name__}: {exc}")
             self.state_changed.emit("error")
         finally:
+            self.progress_changed.emit("idle", {})
             with contextlib.suppress(ValueError):
                 self.agent._stream_observers.remove(_on_chunk)
             with contextlib.suppress(ValueError):
