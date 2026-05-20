@@ -35,10 +35,17 @@ ENV/
 
 # Devin-local runtime state
 .devin_local/
+.devin-local/
+.devin-local-*
 sessions/
 *.log
 knowledge/.index/
 .cache/
+# Per-user secrets / tokens (Figma PAT, GitHub PAT, etc.) — never commit.
+figma.json
+github.json
+*.pat
+*.token
 
 # OS
 .DS_Store

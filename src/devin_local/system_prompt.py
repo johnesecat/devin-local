@@ -433,6 +433,14 @@ class PromptContext:
     tool_names: list[str] = field(default_factory=list)
     knowledge_blocks: list[str] = field(default_factory=list)
     skill_blocks: list[str] = field(default_factory=list)
+    # Manifest text (path — title: summary) for the per-session knowledge
+    # directory. The file BODIES are not embedded; the agent uses
+    # `knowledge_search` / `knowledge_read` to load them on demand.
+    knowledge_manifest: str = ""
+    # Per-session system-prompt override. When non-empty, this string is
+    # prepended verbatim and the rest of the assembled prompt follows. The
+    # operator sets this from the Per-session Settings dialog.
+    system_prompt_override: str = ""
     enable_obliteratus: bool = True
     extra_sections: list[str] = field(default_factory=list)
 
@@ -464,27 +472,39 @@ def _env_section(workspace: Path, model: str, tools: list[str]) -> str:
 
 def build_system_prompt(ctx: PromptContext) -> str:
     """Assemble the full system prompt string."""
-    parts: list[str] = [
-        IDENTITY,
-        WHEN_TO_COMMUNICATE,
-        APPROACH_TO_WORK,
-        TRUTHFUL_AND_TRANSPARENT,
-        CODING_BEST_PRACTICES,
-        INFORMATION_HANDLING,
-        DATA_SECURITY,
-        RESPONSE_LIMITATIONS,
-        MODES,
-        PLANNING_GUIDANCE,
-        REASONING_DISCIPLINE,
-        TOOL_USE_DISCIPLINE,
-        PROJECT_INTEGRATIONS,
-        PLATFORM_GUIDANCE,
-        GIT_OPERATIONS,
-        COMPLETION,
-        _env_section(ctx.workspace, ctx.model, ctx.tool_names),
-    ]
+    parts: list[str] = []
+    if ctx.system_prompt_override.strip():
+        parts.append(
+            "## Session prompt override\n\n"
+            "The operator configured a custom system prompt for this session. "
+            "Apply it on top of the rest of the guidance below.\n\n"
+            + ctx.system_prompt_override.strip()
+        )
+    parts.extend(
+        [
+            IDENTITY,
+            WHEN_TO_COMMUNICATE,
+            APPROACH_TO_WORK,
+            TRUTHFUL_AND_TRANSPARENT,
+            CODING_BEST_PRACTICES,
+            INFORMATION_HANDLING,
+            DATA_SECURITY,
+            RESPONSE_LIMITATIONS,
+            MODES,
+            PLANNING_GUIDANCE,
+            REASONING_DISCIPLINE,
+            TOOL_USE_DISCIPLINE,
+            PROJECT_INTEGRATIONS,
+            PLATFORM_GUIDANCE,
+            GIT_OPERATIONS,
+            COMPLETION,
+            _env_section(ctx.workspace, ctx.model, ctx.tool_names),
+        ]
+    )
     if ctx.enable_obliteratus:
         parts.append(obliteratus.render())
+    if ctx.knowledge_manifest.strip():
+        parts.append("## Knowledge directory\n\n" + ctx.knowledge_manifest.strip())
     if ctx.knowledge_blocks:
         parts.append("## Injected knowledge\n\n" + "\n\n---\n\n".join(ctx.knowledge_blocks))
     if ctx.skill_blocks:

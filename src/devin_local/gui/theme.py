@@ -496,4 +496,74 @@ QDoubleSpinBox, QSpinBox {{
     border-radius: 4px;
     padding: 4px 6px;
 }}
+
+/* ---- per-session row in the sidebar ---- */
+QWidget#SessionRow {{
+    background-color: transparent;
+    border-radius: 10px;
+}}
+QWidget#SessionRow:hover {{
+    background-color: {p["bg_2"]};
+}}
+QWidget#SessionRow[active="true"] {{
+    background-color: {p["bg_3"]};
+    border: 1px solid {p["accent"]};
+}}
+QLabel#SessionRowName {{
+    font-size: 13px;
+    font-weight: 600;
+    color: {p["fg_0"]};
+}}
+QLabel#SessionRowMeta {{
+    font-size: 11px;
+    color: {p["fg_2"]};
+}}
+QPushButton#SessionRowGear, QPushButton#SessionRowDelete {{
+    background-color: transparent;
+    border: none;
+    border-radius: 6px;
+    color: {p["fg_1"]};
+}}
+QPushButton#SessionRowGear:hover {{
+    background-color: {p["accent"]};
+    color: #0a0c14;
+}}
+QPushButton#SessionRowDelete:hover {{
+    background-color: {p["err"]};
+    color: #0a0c14;
+}}
+QScrollArea#SessionsScroll, QWidget#SessionsContainer {{
+    background-color: transparent;
+    border: none;
+}}
+
+/* ---- UI Creator ---- */
+QListWidget#UiCreatorPalette {{
+    background-color: {p["bg_1"]};
+    border: 1px solid {p["border"]};
+    border-radius: 8px;
+    padding: 6px;
+}}
+QListWidget#UiCreatorPalette::item {{
+    padding: 8px 10px;
+    border-radius: 6px;
+    color: {p["fg_0"]};
+}}
+QListWidget#UiCreatorPalette::item:hover {{
+    background-color: {p["bg_3"]};
+}}
+QFrame#UiCanvas {{
+    background-color: {p["bg_2"]};
+}}
+QPushButton#Danger {{
+    background-color: transparent;
+    color: {p["err"]};
+    border: 1px solid {p["err"]};
+    border-radius: 6px;
+    padding: 6px 10px;
+}}
+QPushButton#Danger:hover {{
+    background-color: {p["err"]};
+    color: #0a0c14;
+}}
 """

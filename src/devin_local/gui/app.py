@@ -47,10 +47,9 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFileSystemModel,
+    QFrame,
     QHBoxLayout,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -76,9 +75,13 @@ from devin_local.gui.ollama_model_service import (
     OllamaModelService,
 )
 from devin_local.gui.sandbox_panel import PlanPane, SandboxPanel
+from devin_local.gui.session_row import SessionRow
+from devin_local.gui.session_settings_dialog import PerSessionSettingsDialog
 from devin_local.gui.theme import stylesheet
 from devin_local.gui.widgets import ChatPane, Composer, ToolCard
 from devin_local.inference.factory import SUPPORTED_BACKENDS, list_available_backends
+from devin_local.sessions import SessionInfo, SessionManager
+from devin_local.settings import Settings
 from devin_local.tools.base import ToolResult
 
 log = logging.getLogger(__name__)
@@ -110,6 +113,18 @@ class MainWindow(QMainWindow):
         self._worker_thread = None
         self._pending_tool_cards: dict[str, ToolCard] = {}
         self._open_tool_cards: list[ToolCard] = []
+
+        # Per-session state.
+        self._global_settings = Settings.load()
+        self._session_manager = SessionManager.for_workspace(self.workspace)
+        self._session_rows: dict[str, SessionRow] = {}
+        # Reuse an existing session if any; otherwise create one so the
+        # sidebar always has at least one selectable row.
+        existing = self._session_manager.list()
+        if existing:
+            self._active_session: SessionInfo | None = existing[0]
+        else:
+            self._active_session = self._session_manager.create(name="Session 1")
 
         self._model_service = OllamaModelService(host=host)
 
@@ -167,9 +182,28 @@ class MainWindow(QMainWindow):
         sessions_label = QLabel("SESSIONS")
         sessions_label.setObjectName("H2")
         layout.addWidget(sessions_label)
-        self._session_list = QListWidget()
-        self._session_list.itemDoubleClicked.connect(self._session_double_clicked)
-        layout.addWidget(self._session_list, 1)
+
+        # Scrollable session list with custom rows (so each row can host
+        # its own gear + delete button).
+        sessions_scroll = QScrollArea()
+        sessions_scroll.setObjectName("SessionsScroll")
+        sessions_scroll.setWidgetResizable(True)
+        sessions_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._sessions_container = QWidget()
+        self._sessions_container.setObjectName("SessionsContainer")
+        self._sessions_layout = QVBoxLayout(self._sessions_container)
+        self._sessions_layout.setContentsMargins(0, 0, 0, 0)
+        self._sessions_layout.setSpacing(4)
+        self._sessions_layout.addStretch(1)
+        sessions_scroll.setWidget(self._sessions_container)
+        layout.addWidget(sessions_scroll, 1)
+
+        # Open the UI Creator (drag-and-drop designer).
+        creator_btn = QPushButton("UI Creator…")
+        creator_btn.setObjectName("Ghost")
+        creator_btn.clicked.connect(self._open_ui_creator)
+        layout.addWidget(creator_btn)
+
         self._refresh_session_list()
 
         settings_btn = QPushButton("Settings")
@@ -312,21 +346,40 @@ class MainWindow(QMainWindow):
     # ---------- agent wiring ----------
 
     def _initialize_agent(self) -> None:
+        info = self._active_session
+        backend_name = info.backend if info and info.backend else self._backend_name
         # If the chosen backend's deps are missing, prompt to install instead
         # of crashing with a stack trace.
-        ok, details = backend_dep_probe(self._backend_name)
+        ok, details = backend_dep_probe(backend_name)
         if not ok:
             self._chat.add_system_notice(
-                f"Backend {self._backend_name!r} not installed ({details}). "
+                f"Backend {backend_name!r} not installed ({details}). "
                 "Use Tools \u2192 Install backend dependencies\u2026 or pick another backend."
             )
             return
 
+        model = info.model if info and info.model else self._model_name
+        knowledge_dir = Path(info.knowledge_dir) if info and info.knowledge_dir else None
         config = AgentConfig(
-            model=self._model_name,
+            model=model,
             workspace=self.workspace,
-            backend=self._backend_name,
+            backend=backend_name,
             ollama_host=self._host,
+            knowledge_dir=knowledge_dir,
+            system_prompt_override=(info.system_prompt_override if info else ""),
+            enable_obliteratus=(
+                info.enable_obliteratus
+                if info and info.enable_obliteratus is not None
+                else self._global_settings.general.enable_obliteratus
+            ),
+            parallel_tool_calls=(
+                info.parallel_tool_calls
+                if info and info.parallel_tool_calls is not None
+                else self._global_settings.general.parallel_tool_calls
+            ),
+            max_iterations=(info.max_iterations or 20) if info else 20,
+            temperature=(info.temperature if info and info.temperature is not None else 0.2),
+            session_path=(self._session_manager.transcript_path(info.id) if info else None),
         )
         try:
             agent = Agent(config)
@@ -496,13 +549,26 @@ class MainWindow(QMainWindow):
         self._refresh_installed_models()
 
     def _new_session(self) -> None:
-        self._chat.clear()
-        self._plan_pane.set_plan([])
-        if self._agent is not None:
-            self._agent.messages = []
-            self._agent.plan = Plan()
-            self._agent._initialized = False  # rebuild system prompt on next turn
-        self._chat.add_system_notice("New session.")
+        """Create a new session on disk and switch to it."""
+        existing = self._session_manager.list()
+        name = f"Session {len(existing) + 1}"
+        info = self._session_manager.create(name=name)
+        self._refresh_session_list()
+        self._switch_session(info.id)
+
+    def _open_ui_creator(self) -> None:
+        try:
+            from devin_local.gui.ui_creator import UiCreatorDialog
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "UI Creator", f"UI Creator unavailable: {exc}")
+            return
+        dlg = UiCreatorDialog(
+            workspace=self.workspace,
+            agent=self._agent,
+            request_submit=self.request_submit,
+            parent=self,
+        )
+        dlg.exec()
 
     def _open_settings(self) -> None:
         from devin_local.gui.settings_dialog import SettingsDialog
@@ -564,18 +630,111 @@ class MainWindow(QMainWindow):
         self._initialize_agent()
 
     def _refresh_session_list(self) -> None:
-        self._session_list.clear()
-        sessions_dir = self.workspace / "sessions"
-        if not sessions_dir.exists():
-            return
-        for path in sorted(sessions_dir.glob("*.jsonl"), reverse=True):
-            item = QListWidgetItem(path.stem)
-            item.setData(Qt.ItemDataRole.UserRole, str(path))
-            self._session_list.addItem(item)
+        """Rebuild the sidebar session rows from disk."""
+        # Clear existing rows (keep the trailing stretch).
+        while self._sessions_layout.count() > 1:
+            item = self._sessions_layout.takeAt(0)
+            widget = item.widget() if item is not None else None
+            if widget is not None:
+                widget.deleteLater()
+        self._session_rows.clear()
 
-    def _session_double_clicked(self, item: QListWidgetItem) -> None:
-        path = item.data(Qt.ItemDataRole.UserRole)
-        QMessageBox.information(self, "Session", f"Session log:\n\n{path}")
+        sessions = self._session_manager.list()
+        if not sessions and self._active_session is not None:
+            # Make sure the active session exists in the list.
+            self._session_manager.save(self._active_session)
+            sessions = [self._active_session]
+
+        active_id = self._active_session.id if self._active_session else None
+        for info in sessions:
+            row = SessionRow(info, active=(info.id == active_id))
+            row.selected.connect(self._switch_session)
+            row.settings_clicked.connect(self._open_session_settings)
+            row.delete_clicked.connect(self._delete_session)
+            self._sessions_layout.insertWidget(self._sessions_layout.count() - 1, row)
+            self._session_rows[info.id] = row
+
+    def _switch_session(self, session_id: str) -> None:
+        """Switch the running agent to a different stored session."""
+        info = self._session_manager.load(session_id)
+        if info is None:
+            return
+        if self._active_session and self._active_session.id == session_id:
+            return
+        self._shutdown_agent()
+        self._active_session = info
+        self._chat.clear()
+        self._plan_pane.set_plan([])
+        self._session_manager.touch(session_id)
+        for sid, row in self._session_rows.items():
+            row.set_active(sid == session_id)
+        self._initialize_agent()
+        self._chat.add_system_notice(
+            f"Loaded session: {info.name}"
+            + ("  ·  custom prompt active" if info.system_prompt_override else "")
+            + (f"  ·  knowledge: {info.knowledge_dir}" if info.knowledge_dir else "")
+        )
+
+    def _open_session_settings(self, session_id: str) -> None:
+        info = self._session_manager.load(session_id)
+        if info is None:
+            return
+        dlg = PerSessionSettingsDialog(info, self._global_settings, parent=self)
+        dlg.session_saved.connect(self._on_session_saved)
+        dlg.exec()
+
+    def _on_session_saved(self, info: SessionInfo) -> None:
+        self._session_manager.save(info)
+        # Update row label / metadata in place.
+        row = self._session_rows.get(info.id)
+        if row is not None:
+            row.update_info(info)
+        # If we just edited the ACTIVE session, push the changes into the
+        # running agent without a restart where possible.
+        if self._active_session and info.id == self._active_session.id:
+            self._active_session = info
+            if self._agent is not None:
+                self._agent.set_system_prompt_override(info.system_prompt_override or "")
+                self._agent.set_knowledge_dir(
+                    Path(info.knowledge_dir) if info.knowledge_dir else None
+                )
+                # Model / backend changes still require a restart — do that
+                # transparently so the operator doesn't have to.
+                model_changed = info.model is not None and info.model != self._agent.config.model
+                backend_changed = (
+                    info.backend is not None and info.backend != self._agent.config.backend
+                )
+                if model_changed or backend_changed:
+                    self._shutdown_agent()
+                    self._initialize_agent()
+            self._chat.add_system_notice(f"Session settings saved: {info.name}")
+
+    def _delete_session(self, session_id: str) -> None:
+        info = self._session_manager.load(session_id)
+        if info is None:
+            return
+        if (
+            QMessageBox.question(
+                self,
+                "Delete session",
+                f"Delete session {info.name!r}? Its transcript and config will be removed.",
+            )
+            != QMessageBox.StandardButton.Yes
+        ):
+            return
+        self._session_manager.delete(session_id)
+        # If we deleted the active session, pick the next one or create one.
+        if self._active_session and self._active_session.id == session_id:
+            self._shutdown_agent()
+            remaining = self._session_manager.list()
+            self._active_session = (
+                remaining[0] if remaining else self._session_manager.create(name="Session 1")
+            )
+            self._refresh_session_list()
+            self._chat.clear()
+            self._initialize_agent()
+        else:
+            self._refresh_session_list()
 
     def _show_about(self) -> None:
         QMessageBox.about(

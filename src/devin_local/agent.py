@@ -34,6 +34,7 @@ from devin_local.inference.backend import (
 )
 from devin_local.inference.factory import build_backend
 from devin_local.inference.types import ChatMessage
+from devin_local.knowledge.index import KnowledgeIndex
 from devin_local.knowledge.store import KnowledgeStore
 from devin_local.mcp.client import MCPClientManager, load_mcp_servers
 from devin_local.ollama_client import (
@@ -74,12 +75,27 @@ class AgentConfig:
     # cheaper on tokens (because the system prompt is cached on the model
     # side), and lets users upload knowledge from the GUI Settings tab
     # knowing it will stay embedded for the whole session.
-    embed_all_knowledge: bool = True
+    embed_all_knowledge: bool = False
     # Soft cap on how many characters of knowledge to inline into the
-    # system prompt. The agent truncates the lowest-priority notes if it
-    # would otherwise blow past this. Default 200k chars (~50k tokens) is
-    # well under llama3.1:8b's 131k-token context window.
+    # system prompt when ``embed_all_knowledge=True``. Ignored otherwise.
     max_embedded_knowledge_chars: int = 200_000
+    # Per-session knowledge directory. Plain ``.md`` / ``.txt`` files dropped
+    # here are exposed to the agent via the ``knowledge_search`` and
+    # ``knowledge_read`` tools, and a tiny manifest (path — title: summary)
+    # is embedded in the system prompt. None means "no directory configured".
+    knowledge_dir: Path | None = None
+    # Cap on the system-prompt manifest size (entries, not characters). Files
+    # past this are referenced as '(+N more)' and discoverable via search.
+    max_manifest_entries: int = 200
+    # Per-session system-prompt override. Empty string means "use the default".
+    system_prompt_override: str = ""
+    # Spill tool outputs larger than this many characters to disk under
+    # ``<workspace>/.devin-local/scratch/`` and keep only a short summary in
+    # the chat history. Memory-efficient mode.
+    max_inline_tool_output_chars: int = 4_000
+    # When True, replace the inline tool output with a short marker pointing
+    # at the spilled file (recoverable via ``read_file``).
+    spill_large_tool_output: bool = True
     temperature: float = 0.2
     session_path: Path | None = None
     num_ctx: int | None = None  # override the backend's context window
@@ -150,6 +166,16 @@ class Agent:
         except Exception:  # noqa: BLE001 - settings dir not writable; fall back.
             user_path = self.workspace / ".devin-local-user-knowledge.jsonl"
         self.user_knowledge = KnowledgeStore.open(user_path)
+        # File-directory-backed knowledge (per-session, near-zero token cost).
+        self.knowledge_index: KnowledgeIndex | None = None
+        if config.knowledge_dir is not None:
+            try:
+                self.knowledge_index = KnowledgeIndex.open(Path(config.knowledge_dir))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("knowledge_dir open failed (%s): %s", config.knowledge_dir, exc)
+                self.knowledge_index = None
+        self._scratch_dir = self.workspace / ".devin-local" / "scratch"
+        self._spill_turn = 0
         self.skills: SkillLoader = load_default_skills(self.workspace)
         self.mcp_manager: MCPClientManager | None = None
         self.system_prompt_sections: list[str] = []
@@ -203,6 +229,7 @@ class Agent:
             self._load_plugins()
         if self.config.enable_mcp:
             self._connect_mcp()
+        self._register_knowledge_tools()
         self._ensure_system_prompt()
         self._initialized = True
 
@@ -213,9 +240,12 @@ class Agent:
         edits, or deletes notes so the change is visible without restarting
         the session. The very next ``handle_user`` will use the new prompt.
         """
-        # Refresh both stores from disk.
+        # Refresh JSONL stores from disk (legacy path).
         self.knowledge = KnowledgeStore.open(self.knowledge.path)
         self.user_knowledge = KnowledgeStore.open(self.user_knowledge.path)
+        # Refresh the directory-backed index too (per-session).
+        if self.knowledge_index is not None:
+            self.knowledge_index.reload()
         # Reload skills too — they're cheap to scan.
         self.skills.reload()
         # Drop the old system message; _ensure_system_prompt will rebuild.
@@ -223,7 +253,61 @@ class Agent:
             self.messages.pop(0)
         self._cached_system_prompt = None
         self._cached_prompt_cache_key = None
+        # Re-register knowledge tools if the index changed.
+        self._register_knowledge_tools()
         self._ensure_system_prompt()
+
+    def set_knowledge_dir(self, path: Path | None) -> None:
+        """Swap the session's knowledge directory at runtime.
+
+        Used by the per-session settings dialog after the operator picks a
+        new knowledge folder. Rebuilds the index, re-registers the tools,
+        and invalidates the cached system prompt.
+        """
+        self.config.knowledge_dir = path
+        if path is None:
+            self.knowledge_index = None
+        else:
+            try:
+                self.knowledge_index = KnowledgeIndex.open(Path(path))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("set_knowledge_dir(%s) failed: %s", path, exc)
+                self.knowledge_index = None
+        if self.messages and self.messages[0].role == "system":
+            self.messages.pop(0)
+        self._cached_system_prompt = None
+        self._cached_prompt_cache_key = None
+        self._register_knowledge_tools()
+        self._ensure_system_prompt()
+
+    def set_system_prompt_override(self, prompt: str) -> None:
+        """Set the per-session system-prompt override and rebuild the prompt."""
+        self.config.system_prompt_override = prompt or ""
+        if self.messages and self.messages[0].role == "system":
+            self.messages.pop(0)
+        self._cached_system_prompt = None
+        self._cached_prompt_cache_key = None
+        self._ensure_system_prompt()
+
+    def _register_knowledge_tools(self) -> None:
+        """(Re-)register the knowledge_search / knowledge_read / knowledge_list tools.
+
+        Removes any previously-registered knowledge tools first so the
+        registry always points at the current index.
+        """
+        for name in ("knowledge_search", "knowledge_read", "knowledge_list"):
+            self.registry.unregister(name)
+        if self.knowledge_index is None:
+            return
+        from devin_local.tools.knowledge_tools import (
+            KnowledgeListTool,
+            KnowledgeReadTool,
+            KnowledgeSearchTool,
+        )
+
+        self.registry.register(KnowledgeSearchTool(self.knowledge_index))
+        self.registry.register(KnowledgeReadTool(self.knowledge_index))
+        self.registry.register(KnowledgeListTool(self.knowledge_index))
 
     def shutdown(self) -> None:
         """Tear down MCP, terminals, and the inference backend."""
@@ -297,11 +381,13 @@ class Agent:
                         observer(name, arguments, result)
                     except Exception:  # noqa: BLE001
                         log.exception("tool observer raised")
+                payload = result.to_chat_payload()
+                payload = self._maybe_spill_tool_output(name, payload)
                 self._append(
                     ChatMessage(
                         role="tool",
                         name=name,
-                        content=result.to_chat_payload(),
+                        content=payload,
                     )
                 )
             self.messages = self.context_manager.maybe_compact(self.messages)
@@ -427,6 +513,38 @@ class Agent:
         except (BackendUnavailableError, OllamaError) as exc:
             return f"(summary failed: {exc})"
 
+    def _maybe_spill_tool_output(self, name: str, payload: str) -> str:
+        """Spill large tool outputs to disk; keep a short pointer in history.
+
+        Saves the operator's context budget. The full body remains
+        recoverable via ``read_file`` if the model needs it again.
+        Disabled when ``AgentConfig.spill_large_tool_output`` is False.
+        """
+        if not self.config.spill_large_tool_output:
+            return payload
+        cap = max(0, self.config.max_inline_tool_output_chars)
+        if cap <= 0 or len(payload) <= cap:
+            return payload
+        try:
+            self._scratch_dir.mkdir(parents=True, exist_ok=True)
+            self._spill_turn += 1
+            spill_path = self._scratch_dir / f"tool-{self._spill_turn:04d}-{name}.txt"
+            spill_path.write_text(payload, encoding="utf-8")
+        except OSError as exc:
+            log.warning("could not spill tool output for %s: %s", name, exc)
+            return payload
+        head = payload[: cap // 2]
+        tail_chars = cap // 4
+        tail = payload[-tail_chars:] if tail_chars > 0 else ""
+        overflow = len(payload) - len(head) - len(tail)
+        marker = (
+            f"\n\n[devin-local] output truncated for memory efficiency. "
+            f"Full body ({len(payload)} chars) saved to {spill_path}. "
+            f"Use read_file with path={spill_path} to load it again.\n"
+            f"[{overflow} chars omitted]\n\n"
+        )
+        return f"{head}{marker}{tail}"
+
     def _ensure_system_prompt(self) -> None:
         if self.messages and self.messages[0].role == "system":
             return
@@ -438,16 +556,31 @@ class Agent:
         tool_names = tuple(self.registry.names())
         knowledge_snapshot = self._knowledge_snapshot()
         skill_snapshot = self._skill_snapshot()
-        cache_key = (tool_names, knowledge_snapshot, skill_snapshot)
+        manifest_snapshot = self._manifest_snapshot()
+        override_snapshot = self.config.system_prompt_override or ""
+        cache_key = (
+            tool_names,
+            knowledge_snapshot,
+            skill_snapshot,
+            manifest_snapshot,
+            override_snapshot,
+        )
         if self._cached_system_prompt is None or self._cached_prompt_cache_key != cache_key:
             knowledge_blocks = self._collect_knowledge_blocks()
             skill_blocks = self._collect_skill_blocks()
+            manifest = ""
+            if self.knowledge_index is not None and self.config.enable_knowledge_injection:
+                manifest = self.knowledge_index.manifest(
+                    max_entries=self.config.max_manifest_entries
+                )
             ctx = PromptContext(
                 workspace=self.workspace,
                 model=self.config.model,
                 tool_names=list(tool_names),
                 knowledge_blocks=knowledge_blocks,
                 skill_blocks=skill_blocks,
+                knowledge_manifest=manifest,
+                system_prompt_override=override_snapshot,
                 enable_obliteratus=self.config.enable_obliteratus,
                 extra_sections=self.system_prompt_sections,
             )
@@ -457,6 +590,11 @@ class Agent:
         self.messages.insert(0, ChatMessage(role="system", content=self._cached_system_prompt))
         if self.session is not None:
             self.session.replace_all(self.messages)
+
+    def _manifest_snapshot(self) -> tuple[str, ...]:
+        if self.knowledge_index is None or not self.config.enable_knowledge_injection:
+            return ()
+        return self.knowledge_index.fingerprint()
 
     def _knowledge_snapshot(self) -> tuple[str, ...]:
         """Stable identity of the knowledge corpus, used to invalidate cache."""
