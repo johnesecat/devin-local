@@ -113,9 +113,23 @@ pip install -e ".[gui]"
 devin-local-gui
 ```
 
-The app has a sidebar (sessions), main chat pane (streaming token render
-+ collapsible tool-call cards), inspector (workspace file tree, backend
-selector, model picker), and a composer with **Ctrl+Enter to send**.
+The app has:
+
+- **Sidebar**: sessions + Settings.
+- **Main chat pane**: streaming token render, syntax-highlighted code
+  blocks, collapsible tool-call cards with file-output previews, plus a
+  composer (**Ctrl+Enter to send**).
+- **Right inspector**: backend dropdown, model selector (live from Ollama
+  `/api/tags`, plus a "Browse library…" dialog), live `<plan>` pane,
+  sandbox panel (workspace + terminal + desktop + tools + flags), and a
+  workspace file tree.
+- **Settings dialog** (gear button in the sidebar): tabs for **General**
+  (workspace, defaults, parallel tool calls), **MCP** (add/edit/remove/test
+  MCP servers), **GitHub** (paste a PAT, "Test connection" hits `/user`),
+  **Backends** (probe + one-click install for `layered` / `hf` extras),
+  and **Appearance** (theme + font scale + accent).
+- The visual system is documented at `docs/design-system.md` and the
+  tokens live in `src/devin_local/gui/design_tokens.py`.
 
 On Windows you can also launch `devin-local-gui-app` (no console window),
 useful for Start Menu / desktop shortcuts.

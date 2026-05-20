@@ -376,4 +376,74 @@ QToolTip {{
     border: 1px solid {p["border_strong"]};
     padding: 4px 6px;
 }}
+
+/* Settings dialog ---------------------------------------------------- */
+
+QTabWidget::pane {{
+    background-color: {p["bg_1"]};
+    border: 1px solid {p["border"]};
+    border-radius: 8px;
+    top: -1px;
+}}
+
+QTabBar::tab {{
+    background-color: transparent;
+    color: {p["fg_1"]};
+    padding: 8px 16px;
+    margin-right: 4px;
+    border: 1px solid transparent;
+    border-bottom: none;
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+}}
+
+QTabBar::tab:hover {{
+    color: {p["fg_0"]};
+    background-color: {p["bg_2"]};
+}}
+
+QTabBar::tab:selected {{
+    background-color: {p["bg_1"]};
+    color: {p["accent"]};
+    border: 1px solid {p["border"]};
+    border-bottom: 1px solid {p["bg_1"]};
+}}
+
+QLabel#Hint {{
+    color: {p["fg_2"]};
+    font-size: 12px;
+}}
+
+QFormLayout QLabel {{
+    color: {p["fg_1"]};
+}}
+
+QListWidget {{
+    background-color: {p["bg_2"]};
+    border: 1px solid {p["border"]};
+    border-radius: 6px;
+    padding: 4px;
+}}
+
+QListWidget::item {{
+    padding: 6px 8px;
+    border-radius: 4px;
+}}
+
+QListWidget::item:hover {{
+    background-color: {p["bg_3"]};
+}}
+
+QListWidget::item:selected {{
+    background-color: {p["accent"]};
+    color: #0a0c14;
+}}
+
+QDoubleSpinBox, QSpinBox {{
+    background-color: {p["bg_3"]};
+    color: {p["fg_0"]};
+    border: 1px solid {p["border"]};
+    border-radius: 4px;
+    padding: 4px 6px;
+}}
 """

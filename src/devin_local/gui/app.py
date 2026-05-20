@@ -173,6 +173,11 @@ class MainWindow(QMainWindow):
         self._refresh_session_list()
 
         settings_btn = QPushButton("Settings")
+        from devin_local.gui.icons import icon as _icon
+
+        gear = _icon("settings")
+        if gear is not None:
+            settings_btn.setIcon(gear)
         settings_btn.clicked.connect(self._open_settings)
         layout.addWidget(settings_btn)
 
@@ -500,12 +505,32 @@ class MainWindow(QMainWindow):
         self._chat.add_system_notice("New session.")
 
     def _open_settings(self) -> None:
-        QMessageBox.information(
-            self,
-            "Settings",
-            "Backend + model are live-editable in the right inspector. "
-            "Advanced settings (4-bit quantization, layer cache, MCP hosts, "
-            "plugins) live in `devin_local/config.json` in your workspace.",
+        from devin_local.gui.settings_dialog import SettingsDialog
+
+        dlg = SettingsDialog(self)
+        dlg.settings_saved.connect(self._on_settings_saved)
+        dlg.exec()
+
+    def _on_settings_saved(self, settings: object) -> None:
+        from devin_local.settings import Settings
+
+        if not isinstance(settings, Settings):
+            return
+        # Apply changes that don't require an agent restart.
+        if settings.general.workspace and Path(settings.general.workspace) != self.workspace:
+            self._shutdown_agent()
+            self.workspace = Path(settings.general.workspace)
+            self.setWindowTitle(f"devin-local \u2014 {self.workspace.name}")
+            self._status_workspace.setText(f"workspace: {self.workspace}")
+            self._fs_model.setRootPath(str(self.workspace))
+            self._fs_tree.setRootIndex(self._fs_model.index(str(self.workspace)))
+            self._refresh_session_list()
+            self._chat.clear()
+            self._chat.set_workspace(self.workspace)
+            self._sandbox.set_workspace(self.workspace)
+        self._chat.add_system_notice(
+            f"Settings saved. Defaults: model={settings.general.default_model}, "
+            f"backend={settings.general.default_backend}."
         )
 
     def _choose_workspace(self) -> None:
