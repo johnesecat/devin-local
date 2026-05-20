@@ -177,13 +177,32 @@ def test_slim_keeps_core_section_headers() -> None:
     prompt = _build()
     for header in (
         "## Honesty and Security",
+        "## Modes",
         "## Tool Use",
         "## Plan-first workflow",
+        "## Persistence and Escalation",
         "## Coding",
         "## Completion",
         "## Environment",
     ):
         assert header in prompt, f"slim prompt missing section: {header}"
+
+
+def test_slim_modes_section_describes_planning_standard_edit() -> None:
+    prompt = _build()
+    assert "**planning**" in prompt
+    assert "**standard**" in prompt
+    assert "**edit**" in prompt
+
+
+def test_slim_persistence_includes_escalation_and_checklist_rules() -> None:
+    prompt = _build()
+    # The Devin-style "don't silently work around wrong assumptions" rule.
+    assert "escalate" in prompt.lower()
+    # The "broken infrastructure -> stop retrying" exception.
+    assert "broken infrastructure" in prompt.lower()
+    # The "long task -> use a checklist file" rule.
+    assert "checklist" in prompt.lower()
 
 
 # ---------------------------------------------------------------------------
