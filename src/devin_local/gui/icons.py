@@ -46,6 +46,16 @@ ICON_MAP: dict[str, tuple[str, str]] = {
     "mcp": ("mdi.transit-connection-variant", "⇄"),
     "appearance": ("mdi.palette-outline", "❖"),
     "general": ("mdi.tune", "≡"),
+    "figma": ("mdi.alpha-f-box", "F"),
+    "knowledge": ("mdi.book-open-page-variant", "📖"),
+    "import": ("mdi.download-outline", "⤓"),
+    "export": ("mdi.upload-outline", "⤒"),
+    "design": ("mdi.shape-outline", "◇"),
+    "ui_creator": ("mdi.gesture-tap", "⬚"),
+    "session": ("mdi.message-text-outline", "✎"),
+    "edit": ("mdi.pencil-outline", "✎"),
+    "open": ("mdi.folder-open-outline", "📂"),
+    "save": ("mdi.content-save", "💾"),
 }
 
 

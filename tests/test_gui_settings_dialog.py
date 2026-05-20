@@ -30,7 +30,15 @@ def test_settings_dialog_has_all_tabs() -> None:
     from devin_local.gui.settings_dialog import SettingsDialog
 
     dlg = SettingsDialog()
-    expected = ["General", "MCP", "GitHub", "Backends", "Knowledge", "Appearance"]
+    expected = [
+        "General",
+        "MCP",
+        "GitHub",
+        "Backends",
+        "Knowledge",
+        "Figma",
+        "Appearance",
+    ]
     actual = [dlg._tabs.tabText(i) for i in range(dlg._tabs.count())]
     assert actual == expected
 

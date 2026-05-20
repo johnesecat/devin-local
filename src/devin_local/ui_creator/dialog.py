@@ -679,10 +679,13 @@ class UiCreatorDialog(QDialog):
         self._save_btn = QPushButton("Save")
         self._save_btn.setObjectName("Primary")
         self._mount_btn = QPushButton("Mount preview\u2026")
+        self._figma_btn = QPushButton("Import from Figma\u2026")
         self._open_btn.clicked.connect(self._on_open)
         self._save_btn.clicked.connect(self._on_save)
         self._mount_btn.clicked.connect(self._on_mount)
+        self._figma_btn.clicked.connect(self._on_import_figma)
         btn_row.addWidget(self._open_btn)
+        btn_row.addWidget(self._figma_btn)
         btn_row.addStretch(1)
         btn_row.addWidget(self._mount_btn)
         btn_row.addWidget(self._save_btn)
@@ -753,6 +756,84 @@ class UiCreatorDialog(QDialog):
         self._props = _PropertiesPanel(self._doc)
         self._props.element_changed.connect(self._on_props_changed)
         QMessageBox.information(self, "Open UI", f"Loaded {path.name}.")
+
+    def _on_import_figma(self) -> None:
+        """Pull a Figma file via the saved PAT and materialize its frames as
+        UI Creator elements on the canvas. Replaces the current document.
+        """
+        from devin_local.figma.client import (
+            FigmaClient,
+            FigmaError,
+            load_figma_settings,
+            remember_last_file,
+        )
+        from devin_local.figma.import_design import import_figma_file_as_document
+
+        fs = load_figma_settings()
+        if not fs.token:
+            QMessageBox.information(
+                self,
+                "Figma",
+                "No Figma PAT configured.\n\n"
+                "Open Settings \u2192 Figma and paste a personal access token first.",
+            )
+            return
+        url, ok = QInputDialog.getText(
+            self,
+            "Import from Figma",
+            "Figma file URL or key:",
+            text=fs.last_file_url or fs.last_file_key,
+        )
+        if not ok or not str(url).strip():
+            return
+        url = str(url).strip()
+        try:
+            client = FigmaClient(token=fs.token)
+            payload = client.get_file(url, depth=4)
+        except FigmaError as exc:
+            QMessageBox.warning(self, "Figma", f"Fetch failed:\n\n{exc}")
+            return
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "Figma", f"Unexpected error:\n\n{exc}")
+            return
+        try:
+            new_doc = import_figma_file_as_document(payload)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "Figma", f"Could not convert design:\n\n{exc}")
+            return
+        if not new_doc.elements:
+            QMessageBox.information(
+                self,
+                "Figma",
+                "Imported file had no convertible frames. "
+                "Pick a file with a top-level FRAME containing TEXT or rounded RECTANGLEs.",
+            )
+            return
+        # Replace the current canvas with the imported document.
+        self._doc = new_doc
+        self._name_edit.setText(self._doc.name)
+        old = self._canvas
+        new_canvas = _Canvas(self._doc)
+        new_canvas.element_added.connect(lambda e: self._props.show_element(e.id))
+        new_canvas.element_selected.connect(self._props.show_element)
+        new_canvas.element_changed.connect(self._on_canvas_element_changed)
+        parent_layout = old.parent()
+        if isinstance(parent_layout, QScrollArea):
+            parent_layout.setWidget(new_canvas)
+        self._canvas = new_canvas
+        self._props = _PropertiesPanel(self._doc)
+        self._props.element_changed.connect(self._on_props_changed)
+        import contextlib
+
+        with contextlib.suppress(FigmaError):
+            remember_last_file(url)
+        n = len(new_doc.elements)
+        QMessageBox.information(
+            self,
+            "Figma",
+            f"Imported '{new_doc.name}' \u2014 {n} elements.\n\n"
+            "Click any element to tweak its properties on the right.",
+        )
 
     def _on_mount(self) -> None:
         ctx = self._build_runtime_context()

@@ -153,12 +153,17 @@ QPushButton {{
     background-color: {p["bg_3"]};
     color: {p["fg_0"]};
     border: 1px solid {p["border_strong"]};
-    padding: 6px 12px;
-    border-radius: 6px;
+    padding: 7px 14px;
+    border-radius: 10px;
 }}
 
 QPushButton:hover {{
     background-color: {p["bg_4"]};
+    border: 1px solid {p["accent"]};
+}}
+
+QPushButton:pressed {{
+    background-color: {p["bg_2"]};
 }}
 
 QPushButton#Primary {{
@@ -166,23 +171,29 @@ QPushButton#Primary {{
     color: #0a0c14;
     border: none;
     font-weight: 600;
+    padding: 7px 16px;
+    border-radius: 10px;
 }}
 
 QPushButton#Primary:hover {{
     background-color: #98b6f9;
 }}
 
+QPushButton#Primary:pressed {{
+    background-color: #5b85e8;
+}}
+
 QPushButton#Ghost {{
     background-color: transparent;
     border: none;
     color: {p["fg_1"]};
-    padding: 4px 8px;
+    padding: 5px 10px;
+    border-radius: 8px;
 }}
 
 QPushButton#Ghost:hover {{
     color: {p["accent"]};
     background-color: {p["bg_2"]};
-    border-radius: 4px;
 }}
 
 QPushButton:disabled {{
@@ -195,14 +206,19 @@ QLineEdit, QPlainTextEdit, QTextEdit, QTextBrowser, QComboBox {{
     background-color: {p["bg_2"]};
     color: {p["fg_0"]};
     border: 1px solid {p["border"]};
-    border-radius: 6px;
-    padding: 6px 8px;
+    border-radius: 10px;
+    padding: 7px 10px;
     selection-background-color: {p["accent"]};
     selection-color: #0a0c14;
 }}
 
 QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus, QTextBrowser:focus, QComboBox:focus {{
     border: 1px solid {p["accent"]};
+    background-color: {p["bg_3"]};
+}}
+
+QLineEdit:hover, QComboBox:hover {{
+    border: 1px solid {p["border_strong"]};
 }}
 
 QComboBox::drop-down {{
@@ -270,31 +286,35 @@ QScrollBar::add-line, QScrollBar::sub-line {{
 QFrame#ToolCard {{
     background-color: {p["bg_2"]};
     border: 1px solid {p["border"]};
-    border-radius: 10px;
+    border-radius: 14px;
+}}
+
+QFrame#ToolCard:hover {{
+    border: 1px solid {p["border_strong"]};
 }}
 
 QFrame#MessageBubbleUser {{
     background-color: {p["bg_3"]};
     border: 1px solid {p["border_strong"]};
-    border-radius: 12px;
+    border-radius: 16px;
 }}
 
 QFrame#MessageBubbleAssistant {{
     background-color: {p["bg_2"]};
     border: 1px solid {p["border"]};
-    border-radius: 12px;
+    border-radius: 16px;
 }}
 
 QFrame#CodeBlock {{
     background-color: {p["bg_1"]};
     border: 1px solid {p["border"]};
-    border-radius: 8px;
+    border-radius: 12px;
 }}
 
 QWidget#CodeBlockHeader {{
     background-color: {p["bg_2"]};
-    border-top-left-radius: 8px;
-    border-top-right-radius: 8px;
+    border-top-left-radius: 12px;
+    border-top-right-radius: 12px;
     border-bottom: 1px solid {p["border"]};
 }}
 
@@ -308,7 +328,7 @@ QPlainTextEdit#CodeBlockBody, QTextBrowser#CodeBlockBody {{
 QFrame#PlanPane, QFrame#SandboxPanel {{
     background-color: {p["bg_2"]};
     border: 1px solid {p["border"]};
-    border-radius: 8px;
+    border-radius: 12px;
 }}
 
 QLabel#PillRunning {{
@@ -432,19 +452,19 @@ QToolTip {{
 QTabWidget::pane {{
     background-color: {p["bg_1"]};
     border: 1px solid {p["border"]};
-    border-radius: 8px;
+    border-radius: 12px;
     top: -1px;
 }}
 
 QTabBar::tab {{
     background-color: transparent;
     color: {p["fg_1"]};
-    padding: 8px 16px;
+    padding: 9px 18px;
     margin-right: 4px;
     border: 1px solid transparent;
     border-bottom: none;
-    border-top-left-radius: 6px;
-    border-top-right-radius: 6px;
+    border-top-left-radius: 10px;
+    border-top-right-radius: 10px;
 }}
 
 QTabBar::tab:hover {{
@@ -471,13 +491,13 @@ QFormLayout QLabel {{
 QListWidget {{
     background-color: {p["bg_2"]};
     border: 1px solid {p["border"]};
-    border-radius: 6px;
-    padding: 4px;
+    border-radius: 10px;
+    padding: 6px;
 }}
 
 QListWidget::item {{
-    padding: 6px 8px;
-    border-radius: 4px;
+    padding: 7px 10px;
+    border-radius: 7px;
 }}
 
 QListWidget::item:hover {{
@@ -493,17 +513,45 @@ QDoubleSpinBox, QSpinBox {{
     background-color: {p["bg_3"]};
     color: {p["fg_0"]};
     border: 1px solid {p["border"]};
+    border-radius: 8px;
+    padding: 5px 8px;
+}}
+
+QDoubleSpinBox:focus, QSpinBox:focus {{
+    border: 1px solid {p["accent"]};
+}}
+
+QCheckBox {{
+    spacing: 8px;
+    padding: 2px 0;
+}}
+
+QCheckBox::indicator {{
+    width: 16px;
+    height: 16px;
     border-radius: 4px;
-    padding: 4px 6px;
+    border: 1px solid {p["border_strong"]};
+    background-color: {p["bg_2"]};
+}}
+
+QCheckBox::indicator:hover {{
+    border: 1px solid {p["accent"]};
+}}
+
+QCheckBox::indicator:checked {{
+    background-color: {p["accent"]};
+    border: 1px solid {p["accent"]};
 }}
 
 /* ---- per-session row in the sidebar ---- */
 QWidget#SessionRow {{
     background-color: transparent;
-    border-radius: 10px;
+    border-radius: 12px;
+    border: 1px solid transparent;
 }}
 QWidget#SessionRow:hover {{
     background-color: {p["bg_2"]};
+    border: 1px solid {p["border"]};
 }}
 QWidget#SessionRow[active="true"] {{
     background-color: {p["bg_3"]};
@@ -541,12 +589,12 @@ QScrollArea#SessionsScroll, QWidget#SessionsContainer {{
 QListWidget#UiCreatorPalette {{
     background-color: {p["bg_1"]};
     border: 1px solid {p["border"]};
-    border-radius: 8px;
-    padding: 6px;
+    border-radius: 12px;
+    padding: 8px;
 }}
 QListWidget#UiCreatorPalette::item {{
-    padding: 8px 10px;
-    border-radius: 6px;
+    padding: 9px 12px;
+    border-radius: 8px;
     color: {p["fg_0"]};
 }}
 QListWidget#UiCreatorPalette::item:hover {{
@@ -554,16 +602,39 @@ QListWidget#UiCreatorPalette::item:hover {{
 }}
 QFrame#UiCanvas {{
     background-color: {p["bg_2"]};
+    border-radius: 12px;
 }}
 QPushButton#Danger {{
     background-color: transparent;
     color: {p["err"]};
     border: 1px solid {p["err"]};
-    border-radius: 6px;
-    padding: 6px 10px;
+    border-radius: 10px;
+    padding: 7px 12px;
 }}
 QPushButton#Danger:hover {{
     background-color: {p["err"]};
     color: #0a0c14;
+}}
+
+/* ---- groupbox / divider polish ---- */
+QGroupBox {{
+    border: 1px solid {p["border"]};
+    border-radius: 12px;
+    margin-top: 12px;
+    padding: 10px 8px 8px 8px;
+}}
+
+QGroupBox::title {{
+    subcontrol-origin: margin;
+    left: 12px;
+    padding: 0 4px;
+    color: {p["fg_1"]};
+    font-weight: 600;
+}}
+
+QFrame[frameShape="HLine"] {{
+    border: none;
+    background-color: {p["border"]};
+    max-height: 1px;
 }}
 """

@@ -43,6 +43,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from devin_local.figma.client import (
+    FigmaClient,
+    FigmaError,
+    FigmaSettings,
+    load_figma_settings,
+    parse_file_key,
+    remember_last_file,
+    save_figma_settings,
+)
+from devin_local.figma.tokens import extract_design_tokens, tokens_to_python_module
 from devin_local.gui.backend_installer import backend_dep_probe
 from devin_local.gui.icons import icon
 from devin_local.knowledge.store import KnowledgeStore
@@ -605,6 +615,264 @@ class _KnowledgeTab(QWidget):
         pass
 
 
+class _FigmaVerifyWorker(QObject):
+    """Background worker for Figma API calls so the UI doesn't freeze."""
+
+    finished = Signal(bool, str)  # ok, message (login or error)
+
+    def __init__(self, token: str) -> None:
+        super().__init__()
+        self._token = token
+
+    def run(self) -> None:
+        try:
+            client = FigmaClient(token=self._token)
+            data = client.me()
+        except FigmaError as exc:
+            self.finished.emit(False, str(exc))
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.finished.emit(False, f"unexpected: {exc}")
+            return
+        handle = data.get("handle") or data.get("email") or data.get("id") or "?"
+        self.finished.emit(True, str(handle))
+
+
+class _FigmaImportWorker(QObject):
+    """Background worker for the actual file import + token extraction."""
+
+    finished = Signal(bool, str, object)
+    # ok, message, payload-dict (with summary counts + output path) | None
+
+    def __init__(self, token: str, file_url: str, output_path: str) -> None:
+        super().__init__()
+        self._token = token
+        self._file_url = file_url
+        self._output_path = output_path
+
+    def run(self) -> None:
+        try:
+            client = FigmaClient(token=self._token)
+            payload = client.get_file(self._file_url, depth=4)
+        except FigmaError as exc:
+            self.finished.emit(False, str(exc), None)
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.finished.emit(False, f"fetch failed: {exc}", None)
+            return
+        try:
+            tokens = extract_design_tokens(payload)
+            module_text = tokens_to_python_module(tokens)
+            from pathlib import Path as _P
+
+            out = _P(self._output_path)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(module_text, encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            self.finished.emit(False, f"token extraction failed: {exc}", None)
+            return
+        summary = {
+            "file_name": tokens.source_file_name,
+            "file_key": tokens.source_file_key,
+            "colors": len(tokens.colors),
+            "typography": len(tokens.typography),
+            "radii": len(tokens.radii),
+            "spacing": len(tokens.spacing),
+            "shadows": len(tokens.shadows),
+            "output_path": str(out),
+        }
+        self.finished.emit(True, "imported", summary)
+
+
+class _FigmaTab(QWidget):
+    """Settings tab to manage the Figma PAT and import design tokens."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._fs: FigmaSettings = load_figma_settings()
+        form = QFormLayout(self)
+
+        self.token = QLineEdit(self._fs.token)
+        self.token.setEchoMode(QLineEdit.EchoMode.Password)
+        self.token.setPlaceholderText(
+            "figd_… or fig_… (stored locally under ~/.devin-local/figma.json)"
+        )
+
+        self.file_url = QLineEdit(self._fs.last_file_url or self._fs.last_file_key)
+        self.file_url.setPlaceholderText(
+            "https://www.figma.com/file/<KEY>/<name> — or just the file key"
+        )
+
+        self.output_path = QLineEdit("design_tokens_figma.py")
+        self.output_path.setPlaceholderText("Relative path under your workspace")
+
+        self.test_btn = QPushButton("Test connection")
+        self.test_btn.clicked.connect(self._on_test)
+        fig_icon = icon("figma")
+        if fig_icon:
+            self.test_btn.setIcon(fig_icon)
+
+        self.import_btn = QPushButton("Import design tokens")
+        self.import_btn.setObjectName("Primary")
+        self.import_btn.clicked.connect(self._on_import)
+        imp_icon = icon("import")
+        if imp_icon:
+            self.import_btn.setIcon(imp_icon)
+
+        self.status = QLabel(
+            f"Last used file: {self._fs.last_file_key}"
+            if self._fs.last_file_key
+            else "No file imported yet."
+        )
+        self.status.setObjectName("Hint")
+        self.status.setWordWrap(True)
+
+        form.addRow("Personal access token", self.token)
+        form.addRow("File URL or key", self.file_url)
+        form.addRow("Output module", self.output_path)
+        row = QHBoxLayout()
+        row.addWidget(self.test_btn)
+        row.addStretch(1)
+        row.addWidget(self.import_btn)
+        wrapper = QWidget(self)
+        wrapper.setLayout(row)
+        form.addRow("", wrapper)
+        form.addRow("", self.status)
+
+        # Friendly hint about Figma personal access tokens.
+        hint = QLabel(
+            "Get a PAT at https://www.figma.com/developers/personal-access-token — "
+            "scopes: 'File content' (read)."
+        )
+        hint.setObjectName("Hint")
+        hint.setWordWrap(True)
+        form.addRow("", hint)
+
+        self._thread: QThread | None = None
+        self._worker: QObject | None = None
+
+    # ---- handlers ------------------------------------------------------
+
+    def _on_test(self) -> None:
+        tok = self.token.text().strip()
+        if not tok:
+            QMessageBox.warning(self, "Test", "Paste a Figma PAT first.")
+            return
+        self.test_btn.setEnabled(False)
+        self.status.setText("Verifying token via /v1/me…")
+        thread = QThread(self)
+        worker = _FigmaVerifyWorker(tok)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_verified)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._thread = thread
+        self._worker = worker
+        thread.start()
+
+    def _on_verified(self, ok: bool, message: str) -> None:
+        self.test_btn.setEnabled(True)
+        if ok:
+            self.status.setText(f"OK — signed in as @{message}")
+        else:
+            self.status.setText(f"Failed: {message}")
+
+    def _on_import(self) -> None:
+        tok = self.token.text().strip()
+        url = self.file_url.text().strip()
+        rel_out = self.output_path.text().strip() or "design_tokens_figma.py"
+        if not tok:
+            QMessageBox.warning(self, "Import", "Paste a Figma PAT first.")
+            return
+        if not url:
+            QMessageBox.warning(self, "Import", "Paste a Figma file URL or key.")
+            return
+        try:
+            parse_file_key(url)
+        except FigmaError as exc:
+            QMessageBox.warning(self, "Import", f"Could not parse file key: {exc}")
+            return
+        # Resolve output path against the workspace.
+        from pathlib import Path as _P
+
+        # Local import so the tab is cheap when unused.
+        from devin_local.settings import Settings as _Settings
+
+        s = _Settings.load()
+        workspace = _P(s.general.workspace).expanduser()
+        out_path = _P(rel_out)
+        if not out_path.is_absolute():
+            out_path = workspace / out_path
+
+        self.import_btn.setEnabled(False)
+        self.test_btn.setEnabled(False)
+        self.status.setText(f"Fetching {url}… (this can take a few seconds)")
+
+        thread = QThread(self)
+        worker = _FigmaImportWorker(tok, url, str(out_path))
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_imported)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._thread = thread
+        self._worker = worker
+        thread.start()
+
+    def _on_imported(self, ok: bool, message: str, payload: object) -> None:
+        self.import_btn.setEnabled(True)
+        self.test_btn.setEnabled(True)
+        if not ok:
+            self.status.setText(f"Import failed: {message}")
+            QMessageBox.warning(self, "Import", f"Failed: {message}")
+            return
+        assert isinstance(payload, dict)
+        out = payload.get("output_path", "?")
+        self.status.setText(
+            "Imported '{name}' \u2192 {colors} colors, {typo} text styles, "
+            "{rad} radii, {sp} spacing, {sh} shadows \u2192 {out}".format(
+                name=payload.get("file_name", "?"),
+                colors=payload.get("colors", 0),
+                typo=payload.get("typography", 0),
+                rad=payload.get("radii", 0),
+                sp=payload.get("spacing", 0),
+                sh=payload.get("shadows", 0),
+                out=out,
+            )
+        )
+        QMessageBox.information(
+            self,
+            "Imported",
+            f"Wrote {out}\n\nImport the module from this path to apply the tokens.",
+        )
+
+    # ---- persistence ---------------------------------------------------
+
+    def apply(self) -> None:
+        """Persist token + last file. The PAT is written to disk with 0600 perms
+        by ``save_figma_settings`` so we never echo it back into logs.
+        """
+        self._fs.token = self.token.text().strip()
+        url = self.file_url.text().strip()
+        if url:
+            try:
+                self._fs.last_file_key = parse_file_key(url)
+                self._fs.last_file_url = url
+            except FigmaError:
+                self._fs.last_file_url = url
+        save_figma_settings(self._fs)
+        # Convenience: also remember in case the user typed a URL but didn't
+        # press Import. This keeps the field sticky between sessions.
+        if url:
+            import contextlib
+
+            with contextlib.suppress(FigmaError):
+                remember_last_file(url)
+
+
 class _AppearanceTab(QWidget):
     def __init__(self, settings: Settings, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -659,6 +927,7 @@ class SettingsDialog(QDialog):
         self.github_tab = _GitHubTab()
         self.backends_tab = _BackendsTab()
         self.knowledge_tab = _KnowledgeTab()
+        self.figma_tab = _FigmaTab()
         self.appearance_tab = _AppearanceTab(self._settings)
         # Re-emit so the main window can refresh the running agent's prompt.
         self.knowledge_tab.knowledge_changed.connect(self.knowledge_changed)
@@ -668,7 +937,8 @@ class SettingsDialog(QDialog):
             ("MCP", self.mcp_tab, "mcp"),
             ("GitHub", self.github_tab, "github"),
             ("Backends", self.backends_tab, "backend"),
-            ("Knowledge", self.knowledge_tab, "general"),
+            ("Knowledge", self.knowledge_tab, "knowledge"),
+            ("Figma", self.figma_tab, "figma"),
             ("Appearance", self.appearance_tab, "appearance"),
         ):
             ico = icon(icon_name)
@@ -695,6 +965,7 @@ class SettingsDialog(QDialog):
         self.github_tab.apply()
         self.backends_tab.apply()
         self.knowledge_tab.apply()
+        self.figma_tab.apply()
         self.settings_saved.emit(self._settings)
         self.accept()
 

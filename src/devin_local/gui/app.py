@@ -558,7 +558,7 @@ class MainWindow(QMainWindow):
 
     def _open_ui_creator(self) -> None:
         try:
-            from devin_local.gui.ui_creator import UiCreatorDialog
+            from devin_local.ui_creator import UiCreatorDialog
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "UI Creator", f"UI Creator unavailable: {exc}")
             return
