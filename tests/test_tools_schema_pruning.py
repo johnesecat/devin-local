@@ -101,10 +101,13 @@ def test_smart_mode_keeps_always_include_tools_even_without_keyword_match(
         _schema("read_file", "Read the contents of a file."),
         _schema("write_file", "Write content to a file."),
         _schema("edit_file", "Edit a file in place."),
-        _schema("list_directory", "List a directory."),
+        _schema("list_dir", "List a directory."),
+        _schema("find_files", "Find files matching a glob."),
+        _schema("grep", "Search file contents."),
         _schema("shell_exec", "Run a shell command."),
         _schema("knowledge_search", "Search the knowledge index."),
         _schema("knowledge_read", "Read a knowledge note."),
+        _schema("knowledge_list", "List knowledge notes."),
         _schema("desktop_screenshot", "Take a screenshot of the desktop."),
     ]
     chosen = agent._select_relevant_tools(schemas)
@@ -114,10 +117,13 @@ def test_smart_mode_keeps_always_include_tools_even_without_keyword_match(
         "read_file",
         "write_file",
         "edit_file",
-        "list_directory",
+        "list_dir",
+        "find_files",
+        "grep",
         "shell_exec",
         "knowledge_search",
         "knowledge_read",
+        "knowledge_list",
     ):
         assert name in chosen_names, f"always-include {name!r} got pruned"
     # Keyword match: 'screenshot' / 'desktop' should pull in desktop_screenshot.
@@ -133,7 +139,8 @@ def test_smart_mode_drops_tools_unrelated_to_the_request(tmp_path: Path) -> None
         _schema("read_file"),
         _schema("write_file"),
         _schema("edit_file"),
-        _schema("list_directory"),
+        _schema("list_dir"),
+        _schema("find_files"),
         _schema("shell_exec"),
         _schema("knowledge_search"),
         _schema("knowledge_read"),
@@ -175,3 +182,32 @@ def test_smart_mode_skips_pruning_with_fewer_than_six_tools(tmp_path: Path) -> N
     agent.messages = [ChatMessage(role="user", content="open browser")]
     schemas = [_schema("a"), _schema("b"), _schema("c"), _schema("d"), _schema("e")]
     assert agent._select_relevant_tools(schemas) == schemas
+
+
+def test_always_include_names_match_registered_builtin_tools(tmp_path: Path) -> None:
+    """Every name in ``AgentConfig.always_include_tools`` MUST correspond to
+    an actual registered builtin tool. A typo (e.g. 'list_directory' instead
+    of 'list_dir') silently makes that foundational tool subject to keyword
+    pruning, which is exactly the bug this guard exists to prevent.
+
+    The check is run against an Agent initialized WITH a knowledge_dir so
+    the knowledge tools are registered too — otherwise the assertion would
+    incorrectly flag ``knowledge_search`` etc. as orphaned.
+    """
+    knowledge = tmp_path / "knowledge"
+    knowledge.mkdir()
+    cfg = AgentConfig(
+        workspace=tmp_path,
+        model="llama3.2:1b",
+        backend="ollama",
+        max_iterations=1,
+        knowledge_dir=knowledge,
+    )
+    agent = Agent(cfg, backend=_NoopBackend())
+    agent.initialize()
+    registered = {s["function"]["name"] for s in agent.registry.to_ollama_schemas()}
+    missing = [name for name in cfg.always_include_tools if name not in registered]
+    assert not missing, (
+        f"always_include_tools references nonexistent builtins: {missing}. "
+        f"Registered builtins are: {sorted(registered)}"
+    )

@@ -138,10 +138,13 @@ class AgentConfig:
         "read_file",
         "write_file",
         "edit_file",
-        "list_directory",
+        "list_dir",
+        "find_files",
+        "grep",
         "shell_exec",
         "knowledge_search",
         "knowledge_read",
+        "knowledge_list",
     )
     extra_options: dict[str, Any] = field(default_factory=dict)
 
