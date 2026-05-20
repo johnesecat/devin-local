@@ -233,18 +233,20 @@ class Agent:
                 arguments = parse_tool_call_arguments(raw_args)
                 calls_to_dispatch.append((name, arguments))
 
-            if self.config.parallel_tool_calls and len(calls_to_dispatch) > 1:
-                results = self.registry.dispatch_many(calls_to_dispatch)
-            else:
-                results = [self.registry.dispatch(n, a) for n, a in calls_to_dispatch]
-
-            # Fire tool_started observers before dispatching.
+            # Fire tool_started observers before dispatching so GUIs can
+            # render a "running" pill / start a timer before the tool's side
+            # effects are observable.
             for name, arguments in calls_to_dispatch:
                 for sobs in self._tool_start_observers:
                     try:
                         sobs(name, arguments)
                     except Exception:  # noqa: BLE001
                         log.exception("tool start observer raised")
+
+            if self.config.parallel_tool_calls and len(calls_to_dispatch) > 1:
+                results = self.registry.dispatch_many(calls_to_dispatch)
+            else:
+                results = [self.registry.dispatch(n, a) for n, a in calls_to_dispatch]
 
             for (name, arguments), result in zip(calls_to_dispatch, results, strict=False):
                 tool_results.append((name, result))
