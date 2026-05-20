@@ -121,7 +121,9 @@ def test_aggressive_tool_use_is_explicit() -> None:
 
 def test_env_section_includes_runtime_values() -> None:
     prompt = _build()
-    assert "/tmp/ws" in prompt
+    # Path render differs by platform (/tmp/ws on POSIX, \tmp\ws on Windows);
+    # match the rendered str() of the Path used by _build().
+    assert str(Path("/tmp/ws")) in prompt
     assert "llama3.1:8b" in prompt
     assert "read_file, write_file, shell_exec" in prompt
 
