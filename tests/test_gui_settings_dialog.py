@@ -36,6 +36,7 @@ def test_settings_dialog_has_all_tabs() -> None:
         "GitHub",
         "Backends",
         "Knowledge",
+        "Tools",
         "Figma",
         "Appearance",
     ]

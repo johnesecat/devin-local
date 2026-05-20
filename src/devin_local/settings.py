@@ -64,6 +64,10 @@ class GeneralSettings:
     parallel_tool_calls: bool = True
     enable_obliteratus: bool = True
     enable_planning: bool = True
+    # When True, render the full upstream-style verbose system prompt
+    # (~13 KB). When False (default), use the slim ~3 KB prompt — faster
+    # local inference, same identity / honesty / planning rules.
+    verbose_prompt: bool = False
 
 
 @dataclass
@@ -186,6 +190,20 @@ def save_github(settings: GitHubSettings) -> Path:
     path = _github_path()
     _atomic_write(path, json.dumps(asdict(settings), indent=2), secret=True)
     return path
+
+
+def user_tools_dir() -> Path:
+    """Return the user-level Python-plugin tool directory.
+
+    Drop a ``.py`` file here that calls ``@tool`` and the Agent loads it
+    on the next ``ensure_initialized()``. The GUI's Settings → Tools tab
+    creates / edits / deletes files inside this directory.
+    """
+    tdir = settings_dir() / "tools"
+    tdir.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError, NotImplementedError):
+        os.chmod(tdir, 0o700)
+    return tdir
 
 
 def user_knowledge_path() -> Path:

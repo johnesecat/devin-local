@@ -244,6 +244,19 @@ class _BehaviorTab(QWidget):
         )
         form.addRow(self._parallel_row)
 
+        self._verbose_cb = QCheckBox("Verbose system prompt (~13 KB; slower but more guidance)")
+        self._verbose_cb.setChecked(
+            info.verbose_prompt
+            if info.verbose_prompt is not None
+            else global_settings.general.verbose_prompt
+        )
+        self._verbose_row = _OverrideRow(
+            "Override prompt size",
+            self._verbose_cb,
+            info.verbose_prompt is not None,
+        )
+        form.addRow(self._verbose_row)
+
         self._iters_spin = QSpinBox()
         self._iters_spin.setRange(1, 200)
         self._iters_spin.setValue(info.max_iterations or 20)
@@ -281,6 +294,9 @@ class _BehaviorTab(QWidget):
             ),
             "parallel_tool_calls": (
                 self._parallel_cb.isChecked() if self._parallel_row.is_overridden() else None
+            ),
+            "verbose_prompt": (
+                self._verbose_cb.isChecked() if self._verbose_row.is_overridden() else None
             ),
             "max_iterations": (
                 int(self._iters_spin.value()) if self._iters_row.is_overridden() else None

@@ -464,8 +464,17 @@ class ChatPane(QScrollArea):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.setObjectName("ChatPane")
         self.setWidgetResizable(True)
+        # Match the rest of the app's dark theme. Without these, the
+        # QScrollArea viewport defaults to a near-white system color and
+        # produces the "beige chat area" effect under the dark sidebar.
+        self.setFrameShape(QScrollArea.Shape.NoFrame)
+        viewport = self.viewport()
+        if viewport is not None:
+            viewport.setObjectName("ChatPaneViewport")
         self._container = QWidget()
+        self._container.setObjectName("ChatPaneContainer")
         self._layout = QVBoxLayout(self._container)
         self._layout.setContentsMargins(20, 20, 20, 20)
         self._layout.setSpacing(12)

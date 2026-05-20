@@ -585,6 +585,17 @@ QScrollArea#SessionsScroll, QWidget#SessionsContainer {{
     border: none;
 }}
 
+/* Chat pane — match the dark theme. Without these rules the QScrollArea
+   viewport defaults to a near-white system color, giving the "light beige
+   chat under a dark sidebar" effect the operator flagged. */
+QScrollArea#ChatPane,
+QScrollArea#ChatPane > QWidget#qt_scrollarea_viewport,
+QWidget#ChatPaneViewport,
+QWidget#ChatPaneContainer {{
+    background-color: {p["bg_0"]};
+    border: none;
+}}
+
 /* ---- UI Creator ---- */
 QListWidget#UiCreatorPalette {{
     background-color: {p["bg_1"]};

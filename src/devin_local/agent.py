@@ -89,6 +89,11 @@ class AgentConfig:
     max_manifest_entries: int = 200
     # Per-session system-prompt override. Empty string means "use the default".
     system_prompt_override: str = ""
+    # When True, render the full upstream-style verbose system prompt
+    # (~13 KB). When False (default), use the slim ~3 KB prompt — much
+    # faster for local CPU inference, same identity / honesty / planning
+    # rules.
+    verbose_prompt: bool = False
     # Spill tool outputs larger than this many characters to disk under
     # ``<workspace>/.devin-local/scratch/`` and keep only a short summary in
     # the chat history. Memory-efficient mode.
@@ -230,8 +235,25 @@ class Agent:
         if self.config.enable_mcp:
             self._connect_mcp()
         self._register_knowledge_tools()
+        self._load_user_tools()
         self._ensure_system_prompt()
         self._initialized = True
+
+    def reload_user_tools(self) -> Any:
+        """Re-scan ``~/.devin-local/tools/`` and refresh registrations.
+
+        Returns the loader report so the GUI can surface any per-file
+        errors. Idempotent and safe to call mid-session.
+        """
+        report = self._load_user_tools()
+        # Invalidate the cached prompt so the next turn picks up the new
+        # tool list (tool names are part of the cache key).
+        self._cached_system_prompt = None
+        self._cached_prompt_cache_key = None
+        if self.messages and self.messages[0].role == "system":
+            self.messages.pop(0)
+        self._ensure_system_prompt()
+        return report
 
     def refresh_embedded_knowledge(self) -> None:
         """Re-read the knowledge stores from disk and rebuild the system prompt.
@@ -564,6 +586,7 @@ class Agent:
             skill_snapshot,
             manifest_snapshot,
             override_snapshot,
+            bool(self.config.verbose_prompt),
         )
         if self._cached_system_prompt is None or self._cached_prompt_cache_key != cache_key:
             knowledge_blocks = self._collect_knowledge_blocks()
@@ -583,6 +606,7 @@ class Agent:
                 system_prompt_override=override_snapshot,
                 enable_obliteratus=self.config.enable_obliteratus,
                 extra_sections=self.system_prompt_sections,
+                verbose=self.config.verbose_prompt,
             )
             self._cached_system_prompt = build_system_prompt(ctx)
             self._cached_prompt_cache_key = cache_key
@@ -679,6 +703,26 @@ class Agent:
         # Insert as a system message right before the new user message.
         injected = ChatMessage(role="system", content="\n\n".join(injections))
         self.messages.insert(len(self.messages) - 1, injected)
+
+    def _load_user_tools(self) -> Any:
+        """Register every ``@tool``-decorated function from the user dir."""
+        from devin_local.tools.user_tools import register_user_tools
+
+        try:
+            from devin_local.settings import user_tools_dir
+
+            udir = user_tools_dir()
+        except Exception:  # noqa: BLE001 - settings dir not writable; skip.
+            log.debug("user_tools_dir unavailable; skipping user-tool load")
+            return None
+        try:
+            report = register_user_tools(self.registry, udir)
+        except Exception:  # noqa: BLE001
+            log.exception("user tool registration failed")
+            return None
+        for err in report.errors:
+            log.warning("user tool %s: %s", err.source_path.name, err.message)
+        return report
 
     def _load_plugins(self) -> None:
         plugins = discover_plugins(self.workspace / "plugins")

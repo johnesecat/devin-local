@@ -18,6 +18,7 @@ on **Save**. Cancel discards.
 from __future__ import annotations
 
 from dataclasses import asdict, replace
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QObject, Qt, QThread, Signal
@@ -64,7 +65,13 @@ from devin_local.settings import (
     save_github,
     save_mcp_servers,
     user_knowledge_path,
+    user_tools_dir,
     verify_github_pat,
+)
+from devin_local.tools.user_tools import (
+    list_user_tool_files,
+    load_user_tools,
+    starter_template,
 )
 
 if TYPE_CHECKING:
@@ -114,6 +121,18 @@ class _GeneralTab(QWidget):
         self.planning.setChecked(settings.general.enable_planning)
         form.addRow("", self.planning)
 
+        self.verbose_prompt = QCheckBox(
+            "Verbose system prompt (~13 KB; slower local inference, more guidance)"
+        )
+        self.verbose_prompt.setChecked(settings.general.verbose_prompt)
+        self.verbose_prompt.setToolTip(
+            "When off, devin-local uses the slim ~3 KB system prompt. The slim "
+            "prompt still carries every identity, honesty, security, planning, "
+            "and tool-use rule — only the long elaboration is dropped. Recommended "
+            "for CPU-only inference on small models."
+        )
+        form.addRow("", self.verbose_prompt)
+
     def _on_browse_workspace(self) -> None:
         chosen = QFileDialog.getExistingDirectory(self, "Choose workspace")
         if chosen:
@@ -129,6 +148,7 @@ class _GeneralTab(QWidget):
             parallel_tool_calls=self.parallel.isChecked(),
             enable_obliteratus=self.obliteratus.isChecked(),
             enable_planning=self.planning.isChecked(),
+            verbose_prompt=self.verbose_prompt.isChecked(),
         )
 
 
@@ -909,11 +929,242 @@ class _AppearanceTab(QWidget):
         )
 
 
+class _ToolsTab(QWidget):
+    """Manage user-defined Python tools at ``~/.devin-local/tools/``.
+
+    Capabilities:
+
+    - List every ``.py`` file in the user-tools directory.
+    - For each file: name, source path, and which @tool functions it
+      exposes (or the loader error if the file failed to import).
+    - **New tool**: prompts for a name + description, drops a starter
+      ``.py`` skeleton into the directory.
+    - **Open**: opens the file in the system editor.
+    - **Edit code in app**: inline code editor for quick tweaks; Save
+      writes back to disk.
+    - **Delete**: removes the ``.py``.
+    - **Upload**: copies an existing ``.py`` from disk into the directory.
+    - **Reload**: re-imports every file and refreshes the list.
+
+    The agent picks up changes on the next ``initialize()`` or via
+    ``Agent.reload_user_tools()``.
+    """
+
+    tools_changed = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._directory = user_tools_dir()
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        intro = QLabel(
+            "Custom Python tools registered with the @tool decorator. "
+            "Drop a .py file under "
+            f"<code>{self._directory}</code> "
+            "or use the buttons below. The agent picks the right tool for "
+            "each task on its own — you do not need to mention them."
+        )
+        intro.setWordWrap(True)
+        intro.setTextFormat(Qt.TextFormat.RichText)
+        layout.addWidget(intro)
+
+        self._list = QListWidget()
+        self._list.setObjectName("UserToolsList")
+        self._list.itemSelectionChanged.connect(self._on_selection)
+        layout.addWidget(self._list, 1)
+
+        button_row = QHBoxLayout()
+        self._new_btn = QPushButton("New tool…")
+        self._new_btn.clicked.connect(self._on_new)
+        button_row.addWidget(self._new_btn)
+        self._upload_btn = QPushButton("Upload .py…")
+        self._upload_btn.clicked.connect(self._on_upload)
+        button_row.addWidget(self._upload_btn)
+        self._open_btn = QPushButton("Open file")
+        self._open_btn.clicked.connect(self._on_open)
+        button_row.addWidget(self._open_btn)
+        self._delete_btn = QPushButton("Delete")
+        self._delete_btn.setObjectName("Danger")
+        self._delete_btn.clicked.connect(self._on_delete)
+        button_row.addWidget(self._delete_btn)
+        self._reload_btn = QPushButton("Reload")
+        self._reload_btn.clicked.connect(self._on_reload)
+        button_row.addWidget(self._reload_btn)
+        button_row.addStretch(1)
+        layout.addLayout(button_row)
+
+        editor_label = QLabel("Edit selected file:")
+        layout.addWidget(editor_label)
+        self._editor = QPlainTextEdit()
+        self._editor.setObjectName("CodeBlockBody")
+        self._editor.setPlaceholderText("Select a tool above to view / edit its source.")
+        layout.addWidget(self._editor, 1)
+
+        save_row = QHBoxLayout()
+        save_row.addStretch(1)
+        self._save_btn = QPushButton("Save edits")
+        self._save_btn.clicked.connect(self._on_save_edits)
+        save_row.addWidget(self._save_btn)
+        layout.addLayout(save_row)
+
+        self._refresh()
+
+    # ---- internal ---------------------------------------------------------
+
+    def _current_path(self) -> Path | None:
+        item = self._list.currentItem()
+        if item is None:
+            return None
+        return Path(item.data(Qt.ItemDataRole.UserRole))
+
+    def _refresh(self) -> None:
+        self._list.clear()
+        report = load_user_tools(self._directory)
+        # Group tools by their source file.
+        tools_by_file: dict[str, list[str]] = {}
+        for loaded in report.loaded:
+            tools_by_file.setdefault(str(loaded.source_path), []).append(loaded.tool.name)
+        errors_by_file = {str(err.source_path): err.message for err in report.errors}
+        for py in list_user_tool_files(self._directory):
+            names = tools_by_file.get(str(py), [])
+            err = errors_by_file.get(str(py))
+            if names:
+                label = f"{py.name}  —  {', '.join(names)}"
+            elif err:
+                label = f"{py.name}  —  ⚠ {err}"
+            else:
+                label = f"{py.name}  —  (no @tool functions)"
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, str(py))
+            self._list.addItem(item)
+        self._editor.clear()
+        if self._list.count() > 0:
+            self._list.setCurrentRow(0)
+
+    def _on_selection(self) -> None:
+        path = self._current_path()
+        if path is None or not path.exists():
+            self._editor.clear()
+            return
+        try:
+            self._editor.setPlainText(path.read_text(encoding="utf-8"))
+        except OSError as exc:
+            self._editor.setPlainText(f"# could not read {path}: {exc}")
+
+    def _on_new(self) -> None:
+        name, ok = QInputDialog.getText(
+            self,
+            "New user tool",
+            "Tool name (alphanumeric + underscore):",
+        )
+        if not ok or not name.strip():
+            return
+        safe = "".join(c for c in name.strip() if c.isalnum() or c == "_")
+        if not safe:
+            QMessageBox.warning(self, "Invalid name", "Tool name must be alphanumeric.")
+            return
+        description, ok = QInputDialog.getText(
+            self, "Description", "One-line description of the tool:"
+        )
+        if not ok:
+            description = ""
+        path = Path(self._directory) / f"{safe}.py"
+        if path.exists():
+            QMessageBox.warning(self, "Already exists", f"{path.name} already exists.")
+            return
+        path.write_text(starter_template(safe, description), encoding="utf-8")
+        self._refresh()
+        self._select_path(path)
+        self.tools_changed.emit()
+
+    def _on_upload(self) -> None:
+        chosen, _ = QFileDialog.getOpenFileName(
+            self,
+            "Upload Python tool file",
+            "",
+            "Python files (*.py)",
+        )
+        if not chosen:
+            return
+        src = Path(chosen)
+        dest = Path(self._directory) / src.name
+        if dest.exists():
+            confirm = QMessageBox.question(
+                self,
+                "Overwrite?",
+                f"{dest.name} already exists. Overwrite?",
+            )
+            if confirm != QMessageBox.StandardButton.Yes:
+                return
+        dest.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+        self._refresh()
+        self._select_path(dest)
+        self.tools_changed.emit()
+
+    def _on_open(self) -> None:
+        path = self._current_path()
+        if path is None:
+            return
+        try:
+            from PySide6.QtCore import QUrl
+            from PySide6.QtGui import QDesktopServices
+
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "Open failed", str(exc))
+
+    def _on_delete(self) -> None:
+        path = self._current_path()
+        if path is None:
+            return
+        confirm = QMessageBox.question(
+            self,
+            "Delete tool",
+            f"Delete {path.name}? This cannot be undone.",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            path.unlink()
+        except OSError as exc:
+            QMessageBox.warning(self, "Delete failed", str(exc))
+            return
+        self._refresh()
+        self.tools_changed.emit()
+
+    def _on_reload(self) -> None:
+        self._refresh()
+        self.tools_changed.emit()
+
+    def _on_save_edits(self) -> None:
+        path = self._current_path()
+        if path is None:
+            QMessageBox.information(self, "No file selected", "Select a tool file above first.")
+            return
+        try:
+            path.write_text(self._editor.toPlainText(), encoding="utf-8")
+        except OSError as exc:
+            QMessageBox.warning(self, "Save failed", str(exc))
+            return
+        self._refresh()
+        self._select_path(path)
+        self.tools_changed.emit()
+
+    def _select_path(self, target: Path) -> None:
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            if Path(item.data(Qt.ItemDataRole.UserRole)) == target:
+                self._list.setCurrentRow(i)
+                return
+
+
 class SettingsDialog(QDialog):
     """Multi-tab settings dialog. Returns ``QDialog.Accepted`` on save."""
 
     settings_saved = Signal(object)  # emits the new Settings instance
     knowledge_changed = Signal()  # re-emitted from the Knowledge tab
+    tools_changed = Signal()  # re-emitted from the Tools tab
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -927,10 +1178,12 @@ class SettingsDialog(QDialog):
         self.github_tab = _GitHubTab()
         self.backends_tab = _BackendsTab()
         self.knowledge_tab = _KnowledgeTab()
+        self.tools_tab = _ToolsTab()
         self.figma_tab = _FigmaTab()
         self.appearance_tab = _AppearanceTab(self._settings)
         # Re-emit so the main window can refresh the running agent's prompt.
         self.knowledge_tab.knowledge_changed.connect(self.knowledge_changed)
+        self.tools_tab.tools_changed.connect(self.tools_changed)
 
         for name, widget, icon_name in (
             ("General", self.general_tab, "general"),
@@ -938,6 +1191,7 @@ class SettingsDialog(QDialog):
             ("GitHub", self.github_tab, "github"),
             ("Backends", self.backends_tab, "backend"),
             ("Knowledge", self.knowledge_tab, "knowledge"),
+            ("Tools", self.tools_tab, "tools"),
             ("Figma", self.figma_tab, "figma"),
             ("Appearance", self.appearance_tab, "appearance"),
         ):

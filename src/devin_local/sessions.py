@@ -71,6 +71,11 @@ class SessionInfo:
     parallel_tool_calls: bool | None = None
     max_iterations: int | None = None
     temperature: float | None = None
+    # When True, render the full upstream-style verbose system prompt
+    # (~13 KB). When False (default), use the slim ~3 KB prompt for faster
+    # local inference. The slim prompt still carries every identity /
+    # honesty / security / planning rule, just not the long elaboration.
+    verbose_prompt: bool | None = None
 
     # Free-form notes the operator can jot down in the dialog.
     notes: str = ""

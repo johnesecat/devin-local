@@ -48,6 +48,7 @@ ICON_MAP: dict[str, tuple[str, str]] = {
     "general": ("mdi.tune", "≡"),
     "figma": ("mdi.alpha-f-box", "F"),
     "knowledge": ("mdi.book-open-page-variant", "📖"),
+    "tools": ("mdi.tools", "⚙"),
     "import": ("mdi.download-outline", "⤓"),
     "export": ("mdi.upload-outline", "⤒"),
     "design": ("mdi.shape-outline", "◇"),

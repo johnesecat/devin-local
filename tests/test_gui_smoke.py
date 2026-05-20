@@ -52,6 +52,35 @@ def test_chat_pane_renders_tool_card(qapp, tmp_path: Path) -> None:
     card.finish(ToolResult(ok=True, output='{"ok": true}'))
 
 
+def test_chat_pane_has_dark_theme_object_names(qapp) -> None:
+    """Regression for the 'beige chat under dark sidebar' bug.
+
+    The ChatPane viewport must carry the object names referenced by the
+    theme stylesheet so the dark ``bg_0`` rule actually matches it.
+    Without these the QScrollArea viewport defaults to a near-white system
+    color and the chat looks mismatched with the rest of the dark UI.
+    """
+    pane = ChatPane()
+    assert pane.objectName() == "ChatPane"
+    container = pane.widget()
+    assert container is not None
+    assert container.objectName() == "ChatPaneContainer"
+    viewport = pane.viewport()
+    assert viewport is not None
+    assert viewport.objectName() == "ChatPaneViewport"
+
+
+def test_chat_pane_theme_rule_targets_object_names() -> None:
+    """The dark theme stylesheet must contain a rule that matches the
+    ChatPane's object names — otherwise setting them on the widget is a
+    no-op."""
+    from devin_local.gui.theme import stylesheet
+
+    css = stylesheet()
+    assert "QScrollArea#ChatPane" in css
+    assert "ChatPaneContainer" in css or "ChatPaneViewport" in css
+
+
 def test_message_bubble_renders_code_blocks(qapp, tmp_path: Path) -> None:
     """A bubble with a ```lang fenced block should split it into a dedicated
     code-block child widget (so syntax highlighting + copy button can apply).
@@ -347,6 +376,63 @@ def test_per_session_settings_round_trip(qapp, tmp_path: Path) -> None:
         assert reloaded is not None
         assert "PIRATE" in reloaded.system_prompt_override
         assert reloaded.knowledge_dir == str(kb_dir)
+    finally:
+        dlg.close()
+
+
+def test_per_session_verbose_prompt_toggle_round_trips(qapp, tmp_path: Path) -> None:
+    """The Behavior tab's 'Verbose system prompt' override must round-trip
+    through SessionInfo so the slim/verbose choice actually persists."""
+    from devin_local.gui.session_settings_dialog import PerSessionSettingsDialog
+    from devin_local.sessions import SessionManager
+    from devin_local.settings import Settings
+
+    mgr = SessionManager.for_workspace(tmp_path)
+    info = mgr.create(name="Verbose session")
+    settings = Settings.load()
+    dlg = PerSessionSettingsDialog(info, settings)
+    try:
+        # Default: not overridden -> None.
+        assert dlg._behavior_tab.values()["verbose_prompt"] is None
+        # Flip the override on and check the value.
+        dlg._behavior_tab._verbose_row._cb.setChecked(True)
+        dlg._behavior_tab._verbose_cb.setChecked(True)
+        assert dlg._behavior_tab.values()["verbose_prompt"] is True
+        captured: list = []
+        dlg.session_saved.connect(lambda s: captured.append(s))
+        dlg._on_save()
+        assert captured
+        assert captured[0].verbose_prompt is True
+        # Roundtrip through disk.
+        mgr.save(captured[0])
+        reloaded = mgr.load(captured[0].id)
+        assert reloaded is not None
+        assert reloaded.verbose_prompt is True
+    finally:
+        dlg.close()
+
+
+def test_settings_dialog_tools_tab_lists_user_tool_files(qapp, tmp_path: Path, monkeypatch) -> None:
+    """Settings → Tools tab must list user-defined .py tool files and call
+    ``register_user_tools`` on the running agent when the user clicks
+    'Reload'. This test only covers the listing behavior; the agent-side
+    reload is covered by test_user_tools.py."""
+    from devin_local.gui.settings_dialog import SettingsDialog
+
+    monkeypatch.setenv("DEVIN_LOCAL_HOME", str(tmp_path / "home"))
+    tools_dir = tmp_path / "home" / "tools"
+    tools_dir.mkdir(parents=True)
+    (tools_dir / "wordcount.py").write_text(
+        "from devin_local.tools.user_tools import tool\n\n"
+        '@tool(name="wordcount", description="count words")\n'
+        "def wordcount(args):\n"
+        '    return str(len(args.get("text", "").split()))\n',
+        encoding="utf-8",
+    )
+    dlg = SettingsDialog()
+    try:
+        items = [dlg.tools_tab._list.item(i).text() for i in range(dlg.tools_tab._list.count())]
+        assert any("wordcount.py" in t and "wordcount" in t for t in items)
     finally:
         dlg.close()
 

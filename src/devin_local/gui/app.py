@@ -377,6 +377,11 @@ class MainWindow(QMainWindow):
                 if info and info.parallel_tool_calls is not None
                 else self._global_settings.general.parallel_tool_calls
             ),
+            verbose_prompt=(
+                info.verbose_prompt
+                if info and info.verbose_prompt is not None
+                else self._global_settings.general.verbose_prompt
+            ),
             max_iterations=(info.max_iterations or 20) if info else 20,
             temperature=(info.temperature if info and info.temperature is not None else 0.2),
             session_path=(self._session_manager.transcript_path(info.id) if info else None),
@@ -576,6 +581,7 @@ class MainWindow(QMainWindow):
         dlg = SettingsDialog(self)
         dlg.settings_saved.connect(self._on_settings_saved)
         dlg.knowledge_changed.connect(self._on_knowledge_changed)
+        dlg.tools_changed.connect(self._on_tools_changed)
         dlg.exec()
 
     def _on_knowledge_changed(self) -> None:
@@ -590,6 +596,33 @@ class MainWindow(QMainWindow):
         self._chat.add_system_notice(
             "Knowledge updated \u2014 embedded into the system prompt for subsequent turns."
         )
+
+    def _on_tools_changed(self) -> None:
+        """Reload user tools into the running agent (no restart needed)."""
+        if self._agent is None:
+            self._chat.add_system_notice(
+                "User tools updated \u2014 they will be loaded when the next session starts."
+            )
+            return
+        try:
+            report = self._agent.reload_user_tools()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("reload_user_tools failed: %s", exc)
+            self._chat.add_system_notice(f"Failed to reload user tools: {exc}")
+            return
+        if report is None:
+            return
+        if report.errors:
+            err_lines = [f"\u2022 {e.source_path.name}: {e.message}" for e in report.errors]
+            self._chat.add_system_notice(
+                "User tools reloaded with errors:\n" + "\n".join(err_lines)
+            )
+        else:
+            count = len(report.loaded)
+            self._chat.add_system_notice(
+                f"User tools reloaded ({count} registered). "
+                "The agent picks the right tool for each task automatically."
+            )
 
     def _on_settings_saved(self, settings: object) -> None:
         from devin_local.settings import Settings
