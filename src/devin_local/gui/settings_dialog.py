@@ -56,6 +56,8 @@ from devin_local.figma.client import (
 from devin_local.figma.tokens import extract_design_tokens, tokens_to_python_module
 from devin_local.gui.backend_installer import backend_dep_probe
 from devin_local.gui.icons import icon
+from devin_local.gui.model_selector import LibraryBrowserDialog, ModelComboBox
+from devin_local.gui.ollama_model_service import OllamaModelService
 from devin_local.knowledge.store import KnowledgeStore
 from devin_local.settings import (
     MCPServer,
@@ -78,6 +80,23 @@ if TYPE_CHECKING:
     from PySide6.QtWidgets import QWidget
 
 
+def _safe_list_installed(host: str) -> list[str]:
+    """Best-effort list of installed Ollama model names. ``[]`` on failure.
+
+    Used to populate the model dropdown when the dialog opens. Failure is
+    expected when Ollama isn't running, so we swallow the exception rather
+    than blocking the dialog.
+    """
+    try:
+        service = OllamaModelService(host=host)
+        try:
+            return [m.name for m in service.list_installed()]
+        finally:
+            service.close()
+    except Exception:  # noqa: BLE001
+        return []
+
+
 class _GeneralTab(QWidget):
     def __init__(self, settings: Settings, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -96,7 +115,15 @@ class _GeneralTab(QWidget):
         ws_wrap.setLayout(ws_row)
         form.addRow("Workspace", ws_wrap)
 
-        self.default_model = QLineEdit(settings.general.default_model)
+        # Dropdown populated live from Ollama /api/tags; falls back to a
+        # not-installed entry for whatever the saved default is so the user
+        # still sees their current choice even when Ollama is unreachable.
+        self.default_model = ModelComboBox(
+            installed=_safe_list_installed(settings.general.ollama_host),
+            current=settings.general.default_model,
+            allow_browse=True,
+        )
+        self.default_model.browse_requested.connect(self._on_browse_models)
         form.addRow("Default model", self.default_model)
 
         self.default_backend = QComboBox()
@@ -138,11 +165,31 @@ class _GeneralTab(QWidget):
         if chosen:
             self.workspace.setText(chosen)
 
+    def _on_browse_models(self) -> None:
+        """Open the library browser; on successful pull, refresh the dropdown."""
+        host = self.ollama_host.text().strip() or self._settings.general.ollama_host
+        service = OllamaModelService(host=host)
+        try:
+            installed = service.list_installed()
+        except Exception:  # noqa: BLE001
+            installed = []
+        dialog = LibraryBrowserDialog(service, installed, service.list_library(), parent=self)
+        dialog.pulled.connect(self._on_model_pulled)
+        dialog.exec()
+        service.close()
+
+    def _on_model_pulled(self, name: str) -> None:
+        host = self.ollama_host.text().strip() or self._settings.general.ollama_host
+        installed = _safe_list_installed(host)
+        if name not in installed:
+            installed.append(name)
+        self.default_model.populate(sorted(installed), current=name)
+
     def apply_to(self, settings: Settings) -> None:
         settings.general = replace(
             settings.general,
             workspace=self.workspace.text().strip(),
-            default_model=self.default_model.text().strip() or settings.general.default_model,
+            default_model=self.default_model.current_model() or settings.general.default_model,
             default_backend=self.default_backend.currentText(),
             ollama_host=self.ollama_host.text().strip() or settings.general.ollama_host,
             parallel_tool_calls=self.parallel.isChecked(),

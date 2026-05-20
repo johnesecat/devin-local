@@ -50,7 +50,7 @@ def test_general_tab_round_trips_through_settings_load() -> None:
     from devin_local.settings import Settings
 
     dlg = SettingsDialog()
-    dlg.general_tab.default_model.setText("custom-model:42")
+    dlg.general_tab.default_model.set_current_model("custom-model:42")
     dlg.general_tab.default_backend.setCurrentText("layered")
     dlg.general_tab.parallel.setChecked(False)
     dlg.general_tab.obliteratus.setChecked(False)

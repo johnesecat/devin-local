@@ -31,6 +31,20 @@ DEFAULT_MODEL = "llama3.1:8b"
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
 
 
+def _hw_recommended_default_model() -> str:
+    """Probe hardware and recommend a default model. Empty string on failure.
+
+    Imported lazily so the ``settings`` module stays Qt/torch/etc. free at
+    import time — the agent CLI imports settings before anything else.
+    """
+    try:
+        from devin_local.hardware import recommend_default_model
+
+        return recommend_default_model()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def settings_dir() -> Path:
     """Return the on-disk settings directory, creating it if needed.
 
@@ -88,7 +102,14 @@ class Settings:
     def load(cls) -> Settings:
         path = settings_dir() / "settings.json"
         if not path.exists():
-            return cls()
+            # First launch: pick a model that's actually realistic for this
+            # box. Saves the user from getting an 8 B model on a 4-core
+            # 8 GB VM and waiting ten minutes for the first token.
+            inst = cls()
+            recommended = _hw_recommended_default_model()
+            if recommended:
+                inst.general.default_model = recommended
+            return inst
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):

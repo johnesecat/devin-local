@@ -45,8 +45,22 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from devin_local.gui.model_selector import LibraryBrowserDialog, ModelComboBox
+from devin_local.gui.ollama_model_service import OllamaModelService
 from devin_local.sessions import SessionInfo
 from devin_local.settings import Settings
+
+
+def _safe_list_installed(host: str) -> list[str]:
+    """Best-effort list of installed Ollama models; ``[]`` on failure."""
+    try:
+        service = OllamaModelService(host=host)
+        try:
+            return [m.name for m in service.list_installed()]
+        finally:
+            service.close()
+    except Exception:  # noqa: BLE001
+        return []
 
 
 class _OverrideRow(QWidget):
@@ -81,6 +95,10 @@ class _OverrideRow(QWidget):
 
     def is_overridden(self) -> bool:
         return self._cb.isChecked()
+
+    def set_overridden(self, on: bool) -> None:
+        self._cb.setChecked(on)
+        self._editor.setEnabled(on)
 
 
 class _IdentityTab(QWidget):
@@ -190,7 +208,14 @@ class _BehaviorTab(QWidget):
         form = QFormLayout(self)
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
 
-        self._model_edit = QLineEdit(info.model or global_settings.general.default_model)
+        self._global_settings = global_settings
+        installed = _safe_list_installed(global_settings.general.ollama_host)
+        self._model_edit = ModelComboBox(
+            installed=installed,
+            current=info.model or global_settings.general.default_model,
+            allow_browse=True,
+        )
+        self._model_edit.browse_requested.connect(self._on_browse_models)
         self._model_row = _OverrideRow("Override model", self._model_edit, info.model is not None)
         form.addRow(self._model_row)
 
@@ -280,9 +305,29 @@ class _BehaviorTab(QWidget):
         form.addRow(self._temp_row)
 
     # Public accessors used by the dialog when saving.
+    def _on_browse_models(self) -> None:
+        host = self._global_settings.general.ollama_host
+        service = OllamaModelService(host=host)
+        try:
+            installed = service.list_installed()
+        except Exception:  # noqa: BLE001
+            installed = []
+        dialog = LibraryBrowserDialog(service, installed, service.list_library(), parent=self)
+        dialog.pulled.connect(self._on_model_pulled)
+        dialog.exec()
+        service.close()
+
+    def _on_model_pulled(self, name: str) -> None:
+        host = self._global_settings.general.ollama_host
+        installed = _safe_list_installed(host)
+        if name not in installed:
+            installed.append(name)
+        self._model_edit.populate(sorted(installed), current=name)
+        self._model_row.set_overridden(True)
+
     def values(self) -> dict[str, object]:
         return {
-            "model": self._model_edit.text().strip() if self._model_row.is_overridden() else None,
+            "model": self._model_edit.current_model() if self._model_row.is_overridden() else None,
             "backend": (
                 self._backend_combo.currentText() if self._backend_row.is_overridden() else None
             ),

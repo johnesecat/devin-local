@@ -17,12 +17,18 @@ from __future__ import annotations
 
 import contextlib
 import json
-from dataclasses import dataclass
+import re
+import subprocess
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import httpx
 
 DEFAULT_HOST = "http://127.0.0.1:11434"
+HF_API_BASE = "https://huggingface.co/api"
+HF_BASE = "https://huggingface.co"
 
 
 @dataclass(frozen=True)
@@ -313,3 +319,308 @@ def _progress_from_event(event: dict[str, Any]) -> PullProgress:
         completed=int(event.get("completed") or 0),
         done=done,
     )
+
+
+# ---------------------------------------------------------------------------
+# Hugging Face GGUF catalog
+# ---------------------------------------------------------------------------
+
+
+_GGUF_QUANT_RE = re.compile(
+    r"\.(?:(IQ|Q)\d_[A-Z0-9_]+|F16|FP16|BF16|F32|FP32)(?:\.|$)",
+    re.IGNORECASE,
+)
+
+
+def _quant_from_filename(name: str) -> str:
+    """Pull the quantization label out of a GGUF filename.
+
+    Examples::
+
+        Llama-3.2-3B-Instruct-Q4_K_M.gguf       -> "Q4_K_M"
+        gemma-2-9b-it.F16.gguf                  -> "F16"
+        Qwen2.5-7B-Instruct.IQ3_M.gguf          -> "IQ3_M"
+
+    Returns "?" if no recognizable quant is in the name.
+    """
+    base = name.lower()
+    for marker in (
+        "iq4_nl",
+        "iq4_xs",
+        "iq3_xs",
+        "iq3_xxs",
+        "iq3_s",
+        "iq3_m",
+        "iq2_xs",
+        "iq2_xxs",
+        "iq2_s",
+        "iq2_m",
+        "iq1_s",
+        "iq1_m",
+        "q2_k",
+        "q3_k_s",
+        "q3_k_m",
+        "q3_k_l",
+        "q4_0",
+        "q4_1",
+        "q4_k_s",
+        "q4_k_m",
+        "q5_0",
+        "q5_1",
+        "q5_k_s",
+        "q5_k_m",
+        "q6_k",
+        "q8_0",
+        "fp16",
+        "f16",
+        "bf16",
+        "fp32",
+        "f32",
+    ):
+        if marker in base:
+            return marker.upper()
+    return "?"
+
+
+@dataclass
+class HuggingFaceGGUFFile:
+    """One GGUF artifact attached to a Hugging Face model repository."""
+
+    filename: str
+    size_bytes: int = 0
+    quant: str = "?"
+
+    @property
+    def size_human(self) -> str:
+        return _human_bytes(self.size_bytes)
+
+
+@dataclass
+class HuggingFaceGGUFEntry:
+    """A Hugging Face model that ships GGUF files.
+
+    The browser shows one of these per repo; clicking expands the list of
+    GGUF files inside the repo (each one is independently downloadable).
+    """
+
+    repo_id: str  # e.g. "bartowski/Llama-3.2-3B-Instruct-GGUF"
+    author: str = ""
+    downloads: int = 0
+    likes: int = 0
+    tags: list[str] = field(default_factory=list)
+    last_modified: str = ""
+    pipeline_tag: str = ""
+    library_name: str = ""
+    gguf_files: list[HuggingFaceGGUFFile] = field(default_factory=list)
+
+    @property
+    def display_family(self) -> str:
+        """Cheap family inference from tags + name (llama / qwen / mistral / …)."""
+        text = (self.repo_id + " " + " ".join(self.tags)).lower()
+        for family in (
+            "llama",
+            "qwen",
+            "mistral",
+            "phi",
+            "gemma",
+            "deepseek",
+            "yi",
+            "falcon",
+            "command-r",
+            "codellama",
+            "starcoder",
+        ):
+            if family in text:
+                return family
+        return "other"
+
+    def ollama_name(self, file: HuggingFaceGGUFFile) -> str:
+        """Construct the Ollama tag we'll create for ``file``.
+
+        Format: ``hf.<author>-<repo>:<quant-lowercased>``. Stable across
+        re-runs so the same GGUF doesn't get registered twice.
+        """
+        repo_safe = self.repo_id.replace("/", "-").replace("_", "-").lower()
+        quant = file.quant.lower() if file.quant != "?" else "gguf"
+        return f"hf.{repo_safe}:{quant}"
+
+
+class HuggingFaceCatalog:
+    """Read-only Hugging Face Hub client, scoped to GGUF model discovery.
+
+    Hits ``GET huggingface.co/api/models?library=gguf&...`` and
+    ``GET huggingface.co/api/models/{repo_id}`` to enumerate GGUF files.
+    No auth is required for public models. Downloads stream the bytes
+    straight to disk so a 4 GB GGUF doesn't blow up RAM.
+    """
+
+    def __init__(self, client: httpx.Client | None = None) -> None:
+        self._client = client or httpx.Client(
+            timeout=httpx.Timeout(connect=10.0, read=60.0, write=30.0, pool=5.0),
+            follow_redirects=True,
+        )
+        self._owns_client = client is None
+
+    def close(self) -> None:
+        if self._owns_client:
+            self._client.close()
+
+    def search(
+        self,
+        *,
+        query: str = "",
+        limit: int = 60,
+        sort: str = "downloads",
+        direction: int = -1,
+    ) -> list[HuggingFaceGGUFEntry]:
+        """List GGUF-tagged repos on the Hub. Newest popular first by default."""
+        params: dict[str, Any] = {
+            "library": "gguf",
+            "limit": limit,
+            "sort": sort,
+            "direction": direction,
+            "full": "false",
+        }
+        if query:
+            params["search"] = query
+        resp = self._client.get(f"{HF_API_BASE}/models", params=params, timeout=15.0)
+        resp.raise_for_status()
+        rows = resp.json()
+        if not isinstance(rows, list):
+            return []
+        out: list[HuggingFaceGGUFEntry] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            repo_id = str(row.get("modelId") or row.get("id") or "")
+            if not repo_id:
+                continue
+            tags_raw = row.get("tags") or []
+            tags = [str(t) for t in tags_raw if isinstance(t, str)]
+            out.append(
+                HuggingFaceGGUFEntry(
+                    repo_id=repo_id,
+                    author=str(row.get("author") or repo_id.split("/", 1)[0]),
+                    downloads=int(row.get("downloads") or 0),
+                    likes=int(row.get("likes") or 0),
+                    tags=tags,
+                    last_modified=str(row.get("lastModified") or ""),
+                    pipeline_tag=str(row.get("pipeline_tag") or ""),
+                    library_name=str(row.get("library_name") or "gguf"),
+                )
+            )
+        return out
+
+    def fetch_files(self, repo_id: str) -> list[HuggingFaceGGUFFile]:
+        """Load the list of GGUF files (with sizes) for one repo."""
+        resp = self._client.get(
+            f"{HF_API_BASE}/models/{repo_id}",
+            params={"blobs": "true"},
+            timeout=15.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        siblings = data.get("siblings") if isinstance(data, dict) else None
+        if not isinstance(siblings, list):
+            return []
+        out: list[HuggingFaceGGUFFile] = []
+        for sib in siblings:
+            if not isinstance(sib, dict):
+                continue
+            name = str(sib.get("rfilename") or "")
+            if not name.lower().endswith(".gguf"):
+                continue
+            size_int = 0
+            size_raw = sib.get("size")
+            if isinstance(size_raw, (int, float)) and size_raw:
+                size_int = int(size_raw)
+            elif isinstance(sib.get("lfs"), dict):
+                lfs_size = sib["lfs"].get("size")
+                if isinstance(lfs_size, (int, float)) and lfs_size:
+                    size_int = int(lfs_size)
+            out.append(
+                HuggingFaceGGUFFile(
+                    filename=name,
+                    size_bytes=size_int,
+                    quant=_quant_from_filename(name),
+                )
+            )
+        out.sort(key=lambda f: f.filename)
+        return out
+
+    def download_gguf(
+        self,
+        repo_id: str,
+        filename: str,
+        dest: Path,
+        *,
+        progress: Any = None,
+    ) -> Path:
+        """Stream a GGUF file to ``dest``. ``progress`` is an optional
+        callable ``(completed: int, total: int) -> None`` for live updates.
+
+        Idempotent: skips the download if ``dest`` already exists with a
+        size matching the server-reported ``Content-Length``.
+        """
+        url = f"{HF_BASE}/{repo_id}/resolve/main/{filename}"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        head = self._client.head(url, timeout=15.0)
+        head.raise_for_status()
+        expected = int(head.headers.get("Content-Length") or 0)
+        if dest.exists() and expected and dest.stat().st_size == expected:
+            if progress is not None:
+                progress(expected, expected)
+            return dest
+        tmp = dest.with_suffix(dest.suffix + ".part")
+        with self._client.stream("GET", url, timeout=None) as resp:
+            resp.raise_for_status()
+            total = int(resp.headers.get("Content-Length") or expected or 0)
+            completed = 0
+            with tmp.open("wb") as fh:
+                for chunk in resp.iter_bytes(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+                    fh.write(chunk)
+                    completed += len(chunk)
+                    if progress is not None:
+                        progress(completed, total)
+        tmp.replace(dest)
+        return dest
+
+
+def install_gguf_via_ollama(
+    gguf_path: Path,
+    ollama_name: str,
+    *,
+    ollama_bin: str = "ollama",
+) -> None:
+    """Register a downloaded GGUF with the local Ollama daemon.
+
+    Writes a minimal Modelfile next to the GGUF and runs
+    ``ollama create <ollama_name> -f <Modelfile>``. Raises if the CLI is
+    missing or the create command fails.
+
+    The Modelfile keeps it boring: just ``FROM <path>``. The user can edit
+    the entry afterwards with ``ollama show --modelfile`` if they want a
+    custom template / system prompt / parameters.
+    """
+    if not gguf_path.exists():
+        raise FileNotFoundError(f"gguf not found: {gguf_path}")
+    with tempfile.TemporaryDirectory(prefix="devin-local-modelfile-") as td:
+        modelfile = Path(td) / "Modelfile"
+        modelfile.write_text(f'FROM "{gguf_path.as_posix()}"\n', encoding="utf-8")
+        try:
+            subprocess.run(
+                [ollama_bin, "create", ollama_name, "-f", str(modelfile)],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"`{ollama_bin}` CLI not found on PATH. Install Ollama from https://ollama.com."
+            ) from exc
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or exc.stdout or "").strip()
+            raise RuntimeError(f"`ollama create` failed: {detail[:400]}") from exc
