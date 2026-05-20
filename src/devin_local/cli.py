@@ -544,6 +544,42 @@ def backends_list() -> None:
     console.print(table)
 
 
+@app.command("install")
+def install_extras(
+    extras: list[str] = typer.Argument(
+        ...,
+        help="Pip extras to install (e.g. layered hf gui). Use 'all' for everything.",
+    ),
+) -> None:
+    """Install optional dependencies (layered, hf, gui, all) via pip.
+
+    Streams pip's output directly. Equivalent to::
+
+        pip install -e .[extras]   # editable install
+        pip install devin-local[extras]   # installed package
+
+    Use this to enable the AirLLM-style layered backend or the HuggingFace
+    backend after the base install.
+    """
+    from devin_local.installer import install_extras_sync, pip_command
+
+    norm: list[str] = []
+    for extra in extras:
+        for chunk in extra.split(","):
+            chunk = chunk.strip()
+            if chunk:
+                norm.append(chunk)
+    if "all" in norm:
+        norm = ["layered", "hf", "gui"]
+    if not norm:
+        typer.echo("Specify at least one extra (e.g. layered, hf, gui).", err=True)
+        raise typer.Exit(2)
+    typer.echo("pip command: " + " ".join(pip_command(tuple(norm))))
+    rc = install_extras_sync(tuple(norm))
+    if rc != 0:
+        raise typer.Exit(rc)
+
+
 @app.command("gui")
 def gui(
     workspace: Path = typer.Option(Path.cwd(), "--workspace", "-w"),

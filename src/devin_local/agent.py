@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from devin_local.agent_planning import Plan, parse_plan_block, strip_plan_block
 from devin_local.context_manager import ContextManager, make_default_context_manager
 from devin_local.inference.backend import (
     BackendUnavailableError,
@@ -86,6 +87,8 @@ class AgentTurn:
 
 ToolObserver = Callable[[str, dict[str, Any], ToolResult], None]
 StreamObserver = Callable[[ChatChunk], None]
+ToolStartObserver = Callable[[str, dict[str, Any]], None]
+PlanObserver = Callable[[Plan], None]
 
 
 class Agent:
@@ -135,6 +138,9 @@ class Agent:
         self.session: SessionStore | None = None
         self._observers: list[ToolObserver] = []
         self._stream_observers: list[StreamObserver] = []
+        self._tool_start_observers: list[ToolStartObserver] = []
+        self._plan_observers: list[PlanObserver] = []
+        self.plan: Plan = Plan()
         if config.session_path is not None:
             self.session = SessionStore.open(config.session_path)
             self.messages = list(self.session.messages)
@@ -157,6 +163,14 @@ class Agent:
         loop still owns message accumulation \u2014 observers are read-only.
         """
         self._stream_observers.append(observer)
+
+    def add_tool_start_observer(self, observer: ToolStartObserver) -> None:
+        """Subscribe to ``(name, arguments)`` events fired just before a tool runs."""
+        self._tool_start_observers.append(observer)
+
+    def add_plan_observer(self, observer: PlanObserver) -> None:
+        """Subscribe to plan updates emitted by the agent's planning loop."""
+        self._plan_observers.append(observer)
 
     def initialize(self) -> None:
         """One-time setup: load plugins, connect MCP servers, build system prompt."""
@@ -197,13 +211,16 @@ class Agent:
             self.session.replace_all(self.messages)
 
         tool_results: list[tuple[str, ToolResult]] = []
+        self.plan = Plan()
         for iteration in range(self.config.max_iterations):
             assistant_msg = self._call_model(stream=stream)
             self._append(assistant_msg)
+            self._maybe_update_plan(assistant_msg.content)
 
             if not assistant_msg.tool_calls:
+                final_text = strip_plan_block(assistant_msg.content).strip()
                 return AgentTurn(
-                    assistant_text=assistant_msg.content.strip(),
+                    assistant_text=final_text,
                     tool_results=tool_results,
                     iterations=iteration + 1,
                 )
@@ -220,6 +237,14 @@ class Agent:
                 results = self.registry.dispatch_many(calls_to_dispatch)
             else:
                 results = [self.registry.dispatch(n, a) for n, a in calls_to_dispatch]
+
+            # Fire tool_started observers before dispatching.
+            for name, arguments in calls_to_dispatch:
+                for sobs in self._tool_start_observers:
+                    try:
+                        sobs(name, arguments)
+                    except Exception:  # noqa: BLE001
+                        log.exception("tool start observer raised")
 
             for (name, arguments), result in zip(calls_to_dispatch, results, strict=False):
                 tool_results.append((name, result))
@@ -246,6 +271,23 @@ class Agent:
         )
 
     # ---------- internals ----------
+
+    def _maybe_update_plan(self, assistant_text: str) -> None:
+        """Parse a `<plan>` block from `assistant_text`, merge into self.plan,
+        and notify observers if it changed.
+        """
+        new_plan = parse_plan_block(assistant_text)
+        if new_plan is None:
+            return
+        if self.plan.is_empty():
+            self.plan = new_plan
+        else:
+            self.plan.merge(new_plan)
+        for obs in list(self._plan_observers):
+            try:
+                obs(self.plan)
+            except Exception:  # noqa: BLE001
+                log.exception("plan observer raised")
 
     def _append(self, message: ChatMessage) -> None:
         self.messages.append(message)

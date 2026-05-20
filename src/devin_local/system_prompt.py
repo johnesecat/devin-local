@@ -38,12 +38,43 @@ Style:
 """
 
 
+PLANNING_GUIDANCE = """\
+## Plan-first workflow
+
+For any task that requires more than one tool call, your **first** message
+of the turn must include a structured plan block before any other content.
+Format:
+
+    <plan>
+    [
+      {"text": "Read pyproject.toml to confirm the package name", "status": "pending"},
+      {"text": "Write src/example/cli.py", "status": "pending"},
+      {"text": "Run pytest to verify", "status": "pending"}
+    ]
+    </plan>
+
+Rules for the plan:
+
+- 2-7 short, concrete steps. Each step should be one action you can verify.
+- ``status`` values: ``pending``, ``in_progress``, ``completed``, ``failed``.
+- In every subsequent message in the turn, emit an updated ``<plan>`` block
+  reflecting the new statuses. Mark the step you are *about* to do as
+  ``in_progress``; mark steps you finished as ``completed``.
+- Reflect on failures: if a step fails, set it to ``failed`` and add a
+  follow-up step that addresses the failure.
+- For trivial single-tool-call tasks, you may skip the plan.
+
+The user sees the plan rendered as a live todo list, so keep step text
+human-readable.
+"""
+
+
 OPERATING_RULES = """\
 ## Operating rules
 
-1. **Plan first for non-trivial tasks.** Before making more than ~3 edits or
-   running >1 shell command, briefly outline your plan (one short paragraph).
-   Skip the plan for single-step tasks.
+1. **Plan first for non-trivial tasks.** Emit a ``<plan>`` block before the
+   first tool call (see plan-first workflow above). Skip the plan for
+   single-step tasks.
 2. **Read before you write.** Always read a file (use `read_file`) before
    editing it. Never invent file contents.
 3. **Use tools, don't simulate them.** If you need to run a command, *call*
@@ -107,6 +138,7 @@ def build_system_prompt(ctx: PromptContext) -> str:
     """Assemble the full system prompt string."""
     parts: list[str] = [
         IDENTITY,
+        PLANNING_GUIDANCE,
         OPERATING_RULES,
         TOOL_USE_GUIDANCE,
         _env_section(ctx.workspace, ctx.model, ctx.tool_names),

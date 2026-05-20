@@ -2,25 +2,34 @@
 
 Layout::
 
-    +-----------------------------------------------------+
-    | Sidebar |  Chat pane                  |  Inspector  |
-    |---------|----------------------------|              |
-    | New     |  [user bubble]             |  Workspace   |
-    | session |  [assistant bubble]        |  - files     |
-    |         |  [tool card: write_file]   |  Plugins     |
-    | History |  [assistant bubble]        |  MCP servers |
-    |         |                            |              |
-    |         |----------------------------|              |
-    |         |  Composer + Send           |              |
-    +-----------------------------------------------------+
-    | Status bar: backend  |  model  |  workspace  |  ... |
-    +-----------------------------------------------------+
+    +-------------------------------------------------------+
+    | Sidebar   |  Chat pane                |  Inspector    |
+    |-----------|---------------------------|---------------|
+    | + New     |  [user bubble]            |  Backend      |
+    |           |  [plan card]              |  Model picker |
+    | Sessions  |  [assistant bubble]       |  Plan pane    |
+    |           |  [tool card: write_file]  |  Workspace    |
+    |           |                           |  Sandbox      |
+    |           |---------------------------|               |
+    |           |  Composer + Send          |               |
+    +-------------------------------------------------------+
+    | Status bar: state · backend · model · workspace · …   |
+    +-------------------------------------------------------+
 
-The chat pane and inspector are inside a `QSplitter` so the user can resize
-columns. The sidebar holds a session list (persisted via `SessionStore`).
+Sections are inside a `QSplitter` so the user can resize columns. The agent
+runs on a background thread (`AgentWorker`), so the UI stays responsive even
+when the layered backend grinds through 70B layers.
 
-The agent runs on a background thread (`AgentWorker`), so the UI stays
-responsive even when the layered backend is grinding through 70B layers.
+This window also owns:
+
+- The model selector, which talks to Ollama's ``/api/tags`` to list installed
+  models and opens the library browser dialog to pull new ones.
+- The backend dropdown, which prompts the user to install missing extras
+  (``layered`` / ``hf``) via ``InstallBackendDialog`` rather than just
+  erroring.
+- The plan pane, which reflects the agent's live ``<plan>`` blocks.
+- The sandbox panel, which exposes the workspace path, terminal/desktop
+  state, enabled tools, and security flags.
 """
 
 from __future__ import annotations
@@ -45,6 +54,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSplitter,
     QTreeView,
     QVBoxLayout,
@@ -53,7 +63,19 @@ from PySide6.QtWidgets import (
 
 from devin_local import __version__
 from devin_local.agent import Agent, AgentConfig
+from devin_local.agent_planning import Plan
 from devin_local.gui.agent_worker import AgentWorker, run_in_worker_thread
+from devin_local.gui.backend_installer import (
+    BACKEND_EXTRAS,
+    InstallBackendDialog,
+    backend_dep_probe,
+)
+from devin_local.gui.model_selector import LibraryBrowserDialog, ModelSelector
+from devin_local.gui.ollama_model_service import (
+    InstalledModel,
+    OllamaModelService,
+)
+from devin_local.gui.sandbox_panel import PlanPane, SandboxPanel
 from devin_local.gui.theme import stylesheet
 from devin_local.gui.widgets import ChatPane, Composer, ToolCard
 from devin_local.inference.factory import SUPPORTED_BACKENDS, list_available_backends
@@ -76,7 +98,7 @@ class MainWindow(QMainWindow):
     ) -> None:
         super().__init__()
         self.setWindowTitle(f"devin-local \u2014 {workspace.name}")
-        self.resize(1280, 800)
+        self.resize(1360, 860)
         self.workspace = workspace.resolve()
         self.workspace.mkdir(parents=True, exist_ok=True)
 
@@ -87,10 +109,16 @@ class MainWindow(QMainWindow):
         self._worker: AgentWorker | None = None
         self._worker_thread = None
         self._pending_tool_cards: dict[str, ToolCard] = {}
+        self._open_tool_cards: list[ToolCard] = []
+
+        self._model_service = OllamaModelService(host=host)
 
         self._build_ui()
         self.setStyleSheet(stylesheet())
         self._initialize_agent()
+        # Refresh installed Ollama models in the background after the window
+        # paints so first-paint stays snappy.
+        QTimer.singleShot(50, self._refresh_installed_models)
 
     # ---------- UI construction ----------
 
@@ -107,7 +135,7 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
-        splitter.setSizes([220, 760, 280])
+        splitter.setSizes([220, 760, 360])
         outer.addWidget(splitter, 1)
         outer.addWidget(self._build_status_bar(), 0)
 
@@ -136,7 +164,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(new_btn)
 
         layout.addSpacing(8)
-        sessions_label = QLabel("Sessions")
+        sessions_label = QLabel("SESSIONS")
         sessions_label.setObjectName("H2")
         layout.addWidget(sessions_label)
         self._session_list = QListWidget()
@@ -156,6 +184,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         self._chat = ChatPane()
+        self._chat.set_workspace(self.workspace)
         self._composer = Composer()
         self._composer.submitted.connect(self._on_user_submit)
         layout.addWidget(self._chat, 1)
@@ -163,14 +192,52 @@ class MainWindow(QMainWindow):
         return pane
 
     def _build_inspector(self) -> QWidget:
-        inspector = QWidget()
+        # The inspector is a scrollable column so it doesn't crush its children
+        # when the window is narrow.
+        inspector = QScrollArea()
         inspector.setObjectName("Inspector")
-        inspector.setMinimumWidth(240)
-        layout = QVBoxLayout(inspector)
-        layout.setContentsMargins(12, 16, 12, 12)
-        layout.setSpacing(10)
+        inspector.setWidgetResizable(True)
+        inspector.setMinimumWidth(280)
+        inspector.setFrameShape(inspector.Shape.NoFrame)
 
-        layout.addWidget(_section_label("Workspace"))
+        container = QWidget()
+        container.setObjectName("Inspector")
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(14, 18, 14, 14)
+        layout.setSpacing(14)
+
+        # --- Backend section -------------------------------------------------
+        layout.addWidget(_section_label("BACKEND"))
+        self._backend_combo = QComboBox()
+        for entry in list_available_backends():
+            badge = " · ready" if entry["available"] else " · install"
+            self._backend_combo.addItem(entry["name"] + badge, entry["name"])
+        self._select_backend_in_combo(self._backend_name)
+        self._backend_combo.currentIndexChanged.connect(self._on_backend_changed)
+        layout.addWidget(self._backend_combo)
+
+        self._install_btn = QPushButton("Install backend dependencies\u2026")
+        self._install_btn.setObjectName("Ghost")
+        self._install_btn.setFlat(True)
+        self._install_btn.clicked.connect(self._open_install_dialog)
+        layout.addWidget(self._install_btn)
+        self._update_install_btn_visibility()
+
+        # --- Model section ---------------------------------------------------
+        layout.addWidget(_section_label("MODEL"))
+        self._model_selector = ModelSelector(self._model_name)
+        self._model_selector.model_changed.connect(self._on_model_changed)
+        self._model_selector.refresh_requested.connect(self._refresh_installed_models)
+        self._model_selector.browse_requested.connect(self._open_model_browser)
+        layout.addWidget(self._model_selector)
+
+        # --- Plan ------------------------------------------------------------
+        layout.addWidget(_section_label("PLAN"))
+        self._plan_pane = PlanPane()
+        layout.addWidget(self._plan_pane)
+
+        # --- Workspace tree --------------------------------------------------
+        layout.addWidget(_section_label("WORKSPACE"))
         self._fs_model = QFileSystemModel()
         self._fs_model.setRootPath(str(self.workspace))
         self._fs_tree = QTreeView()
@@ -179,24 +246,17 @@ class MainWindow(QMainWindow):
         self._fs_tree.setHeaderHidden(True)
         for column in range(1, self._fs_model.columnCount()):
             self._fs_tree.hideColumn(column)
+        self._fs_tree.setMinimumHeight(180)
         layout.addWidget(self._fs_tree, 1)
 
-        layout.addWidget(_section_label("Backend"))
-        self._backend_combo = QComboBox()
-        for entry in list_available_backends():
-            badge = " (ready)" if entry["available"] else " (missing)"
-            self._backend_combo.addItem(entry["name"] + badge, entry["name"])
-        self._select_backend_in_combo(self._backend_name)
-        self._backend_combo.currentIndexChanged.connect(self._on_backend_changed)
-        layout.addWidget(self._backend_combo)
+        # --- Sandbox ---------------------------------------------------------
+        layout.addWidget(_section_label("SANDBOX"))
+        self._sandbox = SandboxPanel()
+        self._sandbox.set_workspace(self.workspace)
+        layout.addWidget(self._sandbox)
+        self._refresh_sandbox()
 
-        layout.addWidget(_section_label("Model"))
-        self._model_combo = QComboBox()
-        self._model_combo.setEditable(True)
-        self._model_combo.addItem(self._model_name)
-        self._model_combo.currentTextChanged.connect(self._on_model_changed)
-        layout.addWidget(self._model_combo)
-
+        inspector.setWidget(container)
         return inspector
 
     def _build_status_bar(self) -> QWidget:
@@ -227,6 +287,18 @@ class MainWindow(QMainWindow):
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
 
+        tools_menu = self.menuBar().addMenu("&Tools")
+        browse_action = QAction("Browse Ollama models\u2026", self)
+        browse_action.triggered.connect(self._open_model_browser)
+        tools_menu.addAction(browse_action)
+        refresh_action = QAction("&Refresh installed models", self)
+        refresh_action.setShortcut("Ctrl+R")
+        refresh_action.triggered.connect(self._refresh_installed_models)
+        tools_menu.addAction(refresh_action)
+        install_action = QAction("Install backend dependencies\u2026", self)
+        install_action.triggered.connect(self._open_install_dialog)
+        tools_menu.addAction(install_action)
+
         help_menu = self.menuBar().addMenu("&Help")
         about_action = QAction("&About devin-local", self)
         about_action.triggered.connect(self._show_about)
@@ -235,6 +307,16 @@ class MainWindow(QMainWindow):
     # ---------- agent wiring ----------
 
     def _initialize_agent(self) -> None:
+        # If the chosen backend's deps are missing, prompt to install instead
+        # of crashing with a stack trace.
+        ok, details = backend_dep_probe(self._backend_name)
+        if not ok:
+            self._chat.add_system_notice(
+                f"Backend {self._backend_name!r} not installed ({details}). "
+                "Use Tools \u2192 Install backend dependencies\u2026 or pick another backend."
+            )
+            return
+
         config = AgentConfig(
             model=self._model_name,
             workspace=self.workspace,
@@ -252,7 +334,9 @@ class MainWindow(QMainWindow):
             return
         worker = AgentWorker(agent)
         worker.token.connect(self._on_token)
+        worker.tool_started.connect(self._on_tool_started)
         worker.tool_finished.connect(self._on_tool_finished)
+        worker.plan_updated.connect(self._on_plan_updated)
         worker.turn_finished.connect(self._on_turn_finished)
         worker.error.connect(self._on_error)
         worker.state_changed.connect(self._on_state_changed)
@@ -261,6 +345,7 @@ class MainWindow(QMainWindow):
         self._agent = agent
         self._worker = worker
         self._worker_thread = thread
+        self._refresh_sandbox()
 
     def _shutdown_agent(self) -> None:
         if self._worker is not None:
@@ -280,19 +365,40 @@ class MainWindow(QMainWindow):
 
     def _on_user_submit(self, text: str) -> None:
         if self._worker is None:
-            QMessageBox.warning(self, "No backend", "Agent is not initialized.")
+            QMessageBox.warning(
+                self,
+                "No backend",
+                "Agent is not initialized. Pick a working backend in the right inspector.",
+            )
             return
         self._chat.add_user(text)
         self._chat.start_assistant()
         self._composer.set_busy(True)
+        self._plan_pane.set_plan([])
+        self._open_tool_cards = []
         self.request_submit.emit(text)
 
     def _on_token(self, delta: str) -> None:
         self._chat.append_assistant_delta(delta)
 
+    def _on_tool_started(self, name: str, args: dict) -> None:
+        card = self._chat.add_tool(name, args)
+        self._open_tool_cards.append(card)
+
     def _on_tool_finished(self, name: str, args: dict, result: ToolResult) -> None:
+        # Match to the most recent open card with this tool name, otherwise add one.
+        for card in reversed(self._open_tool_cards):
+            if card._name == name and card._arguments == args:  # noqa: SLF001 - intentional
+                card.finish(result)
+                self._open_tool_cards.remove(card)
+                return
+        # No matching start event (older flows that skipped tool_started):
         card = self._chat.add_tool(name, args)
         card.finish(result)
+        self._refresh_sandbox()
+
+    def _on_plan_updated(self, plan: Plan) -> None:
+        self._plan_pane.set_plan(plan.steps)
 
     def _on_turn_finished(self, final_text: str, tool_count: int, elapsed_s: float) -> None:
         self._chat.finish_assistant(final_text or None)
@@ -300,6 +406,7 @@ class MainWindow(QMainWindow):
         self._status_state.setText(
             f"idle  \u00b7  last turn: {elapsed_s:.1f}s  \u00b7  tools: {tool_count}"
         )
+        self._refresh_sandbox()
 
     def _on_error(self, message: str) -> None:
         self._chat.add_system_notice(f"\u26a0  {message}")
@@ -315,12 +422,21 @@ class MainWindow(QMainWindow):
             return
         self._backend_name = chosen
         self._status_backend.setText(f"backend: {chosen}")
+        self._update_install_btn_visibility()
+        ok, details = backend_dep_probe(chosen)
+        if not ok:
+            self._chat.add_system_notice(
+                f"Backend {chosen!r} requires installing extras. {details}. "
+                "Click the 'Install backend dependencies' button below the backend dropdown."
+            )
+            self._shutdown_agent()
+            return
         self._shutdown_agent()
         self._initialize_agent()
         self._chat.add_system_notice(f"Switched to backend: {chosen}")
 
     def _on_model_changed(self, model: str) -> None:
-        model = model.strip()
+        model = (model or "").strip()
         if not model or model == self._model_name:
             return
         self._model_name = model
@@ -328,10 +444,58 @@ class MainWindow(QMainWindow):
         if self._agent is not None:
             self._agent.config.model = model
 
+    def _update_install_btn_visibility(self) -> None:
+        ok, _ = backend_dep_probe(self._backend_name)
+        self._install_btn.setVisible(not ok and self._backend_name in BACKEND_EXTRAS)
+
+    def _open_install_dialog(self) -> None:
+        if self._backend_name not in BACKEND_EXTRAS:
+            QMessageBox.information(
+                self,
+                "Nothing to install",
+                f"Backend {self._backend_name!r} doesn't have any extras to install.",
+            )
+            return
+        dlg = InstallBackendDialog(self._backend_name, parent=self)
+        dlg.installed.connect(self._on_backend_installed)
+        dlg.exec()
+
+    def _on_backend_installed(self, name: str) -> None:
+        self._chat.add_system_notice(f"Installed backend {name!r}. Switching to it now\u2026")
+        self._update_install_btn_visibility()
+        self._shutdown_agent()
+        self._initialize_agent()
+
+    def _refresh_installed_models(self) -> None:
+        try:
+            models: list[InstalledModel] = self._model_service.list_installed()
+        except Exception as exc:  # noqa: BLE001
+            self._model_selector.set_status(f"Could not reach Ollama: {exc}")
+            return
+        self._model_selector.set_installed([m.name for m in models])
+        self._model_selector.set_current(self._model_name)
+
+    def _open_model_browser(self) -> None:
+        try:
+            installed = self._model_service.list_installed()
+        except Exception:  # noqa: BLE001
+            installed = []
+        library = self._model_service.list_library()
+        dlg = LibraryBrowserDialog(self._model_service, installed, library, parent=self)
+        dlg.pulled.connect(self._on_model_pulled)
+        dlg.exec()
+        self._refresh_installed_models()
+
+    def _on_model_pulled(self, name: str) -> None:
+        self._chat.add_system_notice(f"Installed model {name!r}.")
+        self._refresh_installed_models()
+
     def _new_session(self) -> None:
         self._chat.clear()
+        self._plan_pane.set_plan([])
         if self._agent is not None:
             self._agent.messages = []
+            self._agent.plan = Plan()
             self._agent._initialized = False  # rebuild system prompt on next turn
         self._chat.add_system_notice("New session.")
 
@@ -356,6 +520,8 @@ class MainWindow(QMainWindow):
         self._fs_tree.setRootIndex(self._fs_model.index(str(self.workspace)))
         self._refresh_session_list()
         self._chat.clear()
+        self._chat.set_workspace(self.workspace)
+        self._sandbox.set_workspace(self.workspace)
         self._initialize_agent()
 
     def _refresh_session_list(self) -> None:
@@ -369,9 +535,6 @@ class MainWindow(QMainWindow):
             self._session_list.addItem(item)
 
     def _session_double_clicked(self, item: QListWidgetItem) -> None:
-        # Sessions are append-only JSONL files; loading would require building
-        # the full transcript into the chat pane. For now we just surface the
-        # path so the user can inspect it externally; loading is a follow-up.
         path = item.data(Qt.ItemDataRole.UserRole)
         QMessageBox.information(self, "Session", f"Session log:\n\n{path}")
 
@@ -387,6 +550,34 @@ class MainWindow(QMainWindow):
             "github.com/johnesecat/devin-local</a></p>",
         )
 
+    def _refresh_sandbox(self) -> None:
+        if self._agent is None:
+            self._sandbox.set_terminal_state(str(self.workspace), None)
+            self._sandbox.set_desktop_state(False)
+            self._sandbox.set_tools([])
+            self._sandbox.set_flags(network=False, browser=False, desktop=False)
+            return
+        registry = self._agent.registry
+        names = registry.names()
+        self._sandbox.set_tools(names)
+        # Pull terminal state from the registry's shell_session emulator, if any.
+        cwd = str(self.workspace)
+        last_cmd = None
+        session_tool = registry.get("shell_session")
+        if session_tool is not None:
+            emul = getattr(session_tool, "emulator", None)
+            if emul is not None:
+                cwd = str(getattr(emul, "cwd", cwd) or cwd)
+                last_cmd = getattr(emul, "last_command", None)
+        self._sandbox.set_terminal_state(cwd, last_cmd)
+        desktop_enabled = self._agent.config.enable_desktop
+        self._sandbox.set_desktop_state(desktop_enabled)
+        self._sandbox.set_flags(
+            network=self._agent.config.enable_browser,
+            browser=self._agent.config.enable_browser,
+            desktop=desktop_enabled,
+        )
+
     def _select_backend_in_combo(self, name: str) -> None:
         for i in range(self._backend_combo.count()):
             if self._backend_combo.itemData(i) == name:
@@ -395,6 +586,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # noqa: D401, N802
         self._shutdown_agent()
+        with contextlib.suppress(Exception):
+            self._model_service.close()
         super().closeEvent(event)
 
 

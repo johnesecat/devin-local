@@ -52,6 +52,100 @@ def test_chat_pane_renders_tool_card(qapp, tmp_path: Path) -> None:
     card.finish(ToolResult(ok=True, output='{"ok": true}'))
 
 
+def test_message_bubble_renders_code_blocks(qapp, tmp_path: Path) -> None:
+    """A bubble with a ```lang fenced block should split it into a dedicated
+    code-block child widget (so syntax highlighting + copy button can apply).
+    """
+    from devin_local.gui.syntax import CodeBlockWidget
+    from devin_local.gui.widgets import MessageBubble
+
+    text = "Here:\n```python\nprint('hi')\n```\nDone."
+    bubble = MessageBubble("assistant", text)
+    children = bubble.findChildren(CodeBlockWidget)
+    assert len(children) == 1
+    assert children[0].lang == "python"
+    assert "print" in children[0].code
+
+
+def test_tool_card_for_write_file_renders_file_preview(qapp, tmp_path: Path) -> None:
+    """write_file cards should resolve the path against workspace and embed
+    a CodeBlockWidget when the file exists on disk."""
+    from devin_local.gui.syntax import CodeBlockWidget
+    from devin_local.gui.widgets import ToolCard
+
+    target = tmp_path / "hello.py"
+    target.write_text("print('hi')\n", encoding="utf-8")
+    card = ToolCard("write_file", {"path": "hello.py"}, workspace=tmp_path)
+    card.finish(ToolResult(ok=True, output='{"ok": true, "path": "hello.py"}'))
+    code_blocks = card.findChildren(CodeBlockWidget)
+    assert len(code_blocks) >= 1
+    assert "print" in code_blocks[0].code
+
+
+def test_plan_pane_renders_steps(qapp) -> None:
+    from devin_local.agent_planning import PlanStep
+    from devin_local.gui.sandbox_panel import PlanPane
+
+    pane = PlanPane()
+    pane.set_plan(
+        [
+            PlanStep(text="A", status="completed"),
+            PlanStep(text="B", status="in_progress"),
+            PlanStep(text="C", status="pending"),
+        ]
+    )
+    # Visible row text should reflect statuses.
+    assert pane._list.count() == 3
+    assert "A" in pane._list.item(0).text()
+    assert "B" in pane._list.item(1).text()
+
+
+def test_sandbox_panel_renders_workspace_and_flags(qapp, tmp_path: Path) -> None:
+    from devin_local.gui.sandbox_panel import SandboxPanel
+
+    panel = SandboxPanel()
+    panel.set_workspace(tmp_path)
+    panel.set_terminal_state(str(tmp_path), "ls -la")
+    panel.set_desktop_state(True, "screenshot")
+    panel.set_tools(["read_file", "write_file", "shell_exec"])
+    panel.set_flags(network=True, browser=False, desktop=True)
+    assert str(tmp_path) in panel._workspace_lbl.text()
+    assert "ls -la" in panel._term_lbl.text()
+    assert "3" in panel._tools_lbl.text()
+
+
+def test_model_selector_populates_combo(qapp) -> None:
+    from devin_local.gui.model_selector import ModelSelector
+
+    sel = ModelSelector(current="llama3.1:8b")
+    sel.set_installed(["llama3.1:8b", "qwen2.5:7b", "mistral:7b"])
+    assert sel.current() == "llama3.1:8b"
+    items = [sel._combo.itemData(i) for i in range(sel._combo.count())]
+    assert "llama3.1:8b" in items
+    assert "qwen2.5:7b" in items
+
+
+def test_model_selector_keeps_uninstalled_current_with_marker(qapp) -> None:
+    from devin_local.gui.model_selector import ModelSelector
+
+    sel = ModelSelector(current="ghost-model:8b")
+    sel.set_installed(["llama3.1:8b"])
+    items = [sel._combo.itemText(i) for i in range(sel._combo.count())]
+    # The previous-but-uninstalled model should still appear so the user
+    # knows what's missing.
+    assert any("ghost-model:8b" in t for t in items)
+
+
+def test_main_window_exposes_model_selector_and_plan_pane(qapp, tmp_path: Path) -> None:
+    win = MainWindow(workspace=tmp_path, backend="ollama", model="llama3.1:8b")
+    try:
+        assert win._model_selector.current() == "llama3.1:8b"
+        # Plan pane starts empty.
+        assert win._plan_pane._list.count() == 0
+    finally:
+        win.close()
+
+
 def test_composer_emits_submitted_on_send(qapp) -> None:
     composer = Composer()
     received: list[str] = []

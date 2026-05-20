@@ -14,6 +14,7 @@ from typing import Any
 from PySide6.QtCore import QObject, QThread, Signal, Slot
 
 from devin_local.agent import Agent
+from devin_local.agent_planning import Plan
 from devin_local.inference.backend import ChatChunk
 from devin_local.tools.base import ToolResult
 
@@ -25,6 +26,7 @@ class AgentWorker(QObject):
       - ``token``: incremental token text (str)
       - ``tool_started``: tool name + arguments (str, dict)
       - ``tool_finished``: tool name, arguments, result (str, dict, ToolResult)
+      - ``plan_updated``: snapshot of the current agent plan (object)
       - ``turn_finished``: final assistant text + tool count + elapsed seconds
       - ``error``: backend / agent exception (str)
     """
@@ -32,6 +34,7 @@ class AgentWorker(QObject):
     token = Signal(str)
     tool_started = Signal(str, dict)
     tool_finished = Signal(str, dict, object)  # ToolResult
+    plan_updated = Signal(object)  # Plan
     turn_finished = Signal(str, int, float)
     error = Signal(str)
     state_changed = Signal(str)  # "idle" | "thinking" | "tool" | "error"
@@ -63,8 +66,17 @@ class AgentWorker(QObject):
         def _on_tool(name: str, args: dict[str, Any], result: ToolResult) -> None:
             self.tool_finished.emit(name, args, result)
 
+        def _on_tool_start(name: str, args: dict[str, Any]) -> None:
+            self.tool_started.emit(name, args)
+            self.state_changed.emit("tool")
+
+        def _on_plan(plan: Plan) -> None:
+            self.plan_updated.emit(plan)
+
         self.agent.add_stream_observer(_on_chunk)
         self.agent.add_tool_observer(_on_tool)
+        self.agent.add_tool_start_observer(_on_tool_start)
+        self.agent.add_plan_observer(_on_plan)
         try:
             start = time.monotonic()
             turn = self.agent.handle_user(user_text, stream=self._stream_enabled)
@@ -79,6 +91,10 @@ class AgentWorker(QObject):
                 self.agent._stream_observers.remove(_on_chunk)
             with contextlib.suppress(ValueError):
                 self.agent._observers.remove(_on_tool)
+            with contextlib.suppress(ValueError):
+                self.agent._tool_start_observers.remove(_on_tool_start)
+            with contextlib.suppress(ValueError):
+                self.agent._plan_observers.remove(_on_plan)
 
     @Slot()
     def shutdown(self) -> None:
