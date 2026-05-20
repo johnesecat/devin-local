@@ -83,10 +83,60 @@ QLabel#Muted {{
 }}
 
 QLabel#BubbleAvatar {{
-    color: {p["fg_2"]};
+    color: {p["accent"]};
     font-size: 12px;
-    font-weight: 600;
+    font-weight: 700;
     letter-spacing: 0.5px;
+}}
+
+QLabel#BubbleAvatarUser {{
+    color: {p["fg_1"]};
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+}}
+
+QLabel#BubbleTimestamp {{
+    color: {p["fg_2"]};
+    font-size: 11px;
+    font-weight: 400;
+}}
+
+QPushButton#BubbleCopy {{
+    background-color: transparent;
+    color: {p["fg_2"]};
+    border: none;
+    padding: 2px 8px;
+    font-size: 11px;
+    border-radius: 4px;
+}}
+
+QPushButton#BubbleCopy:hover {{
+    background-color: {p["bg_3"]};
+    color: {p["accent"]};
+}}
+
+QTreeWidget#FolderTree {{
+    background-color: {p["bg_2"]};
+    color: {p["fg_0"]};
+    border: 1px solid {p["border"]};
+    border-radius: 6px;
+    padding: 6px;
+    outline: 0;
+}}
+
+QTreeWidget#FolderTree::item {{
+    padding: 2px 4px;
+    border-radius: 3px;
+}}
+
+QTreeWidget#FolderTree::item:selected {{
+    background-color: {p["bg_4"]};
+    color: {p["accent"]};
+}}
+
+QTreeWidget#FolderTree::item:hover {{
+    background-color: {p["bg_3"]};
 }}
 
 QLabel#ToolIcon {{

@@ -169,6 +169,115 @@ def test_main_window_builds_and_lists_all_backends(qapp, tmp_path: Path) -> None
         win.close()
 
 
+def test_message_bubble_has_copy_button_timestamp_and_role(qapp) -> None:
+    """The polished assistant bubble must surface a role label, timestamp,
+    and a copy-on-hover button so the user can grab the response cleanly."""
+    from devin_local.gui.widgets import MessageBubble
+
+    bubble = MessageBubble("assistant", "hello")
+    assert bubble._avatar.text() == "devin-local"
+    # HH:MM is 5 chars; allow either to permit single-digit hours.
+    assert len(bubble._timestamp.text()) in (4, 5)
+    assert bubble._copy_btn.text() == "Copy"
+    bubble._copy_to_clipboard()
+    assert bubble._copy_btn.text() == "Copied"
+
+
+def test_message_bubble_user_role_uses_user_avatar(qapp) -> None:
+    from devin_local.gui.widgets import MessageBubble
+
+    bubble = MessageBubble("user", "do the thing")
+    assert bubble._avatar.text() == "You"
+    assert bubble._avatar.objectName() == "BubbleAvatarUser"
+
+
+def test_parse_list_dir_output_handles_files_and_dirs() -> None:
+    """The chat tree-card depends on parsing list_dir output reliably."""
+    from devin_local.gui.widgets import parse_list_dir_output
+
+    raw = "dir         0  src\nfile      1234  README.md\nfile        12  .gitignore"
+    entries = parse_list_dir_output(raw)
+    assert entries == [
+        ("dir", "src", 0),
+        ("file", "README.md", 1234),
+        ("file", ".gitignore", 12),
+    ]
+
+
+def test_parse_list_dir_output_handles_empty_marker() -> None:
+    from devin_local.gui.widgets import parse_list_dir_output
+
+    assert parse_list_dir_output("(empty)") == []
+    assert parse_list_dir_output("") == []
+
+
+def test_parse_find_files_output_returns_file_entries() -> None:
+    from devin_local.gui.widgets import parse_find_files_output
+
+    raw = "src/devin_local/cli.py\nsrc/devin_local/gui/app.py\nREADME.md"
+    entries = parse_find_files_output(raw)
+    assert entries == [
+        ("file", "src/devin_local/cli.py", 0),
+        ("file", "src/devin_local/gui/app.py", 0),
+        ("file", "README.md", 0),
+    ]
+
+
+def test_parse_find_files_output_handles_no_matches() -> None:
+    from devin_local.gui.widgets import parse_find_files_output
+
+    assert parse_find_files_output("(no matches)") == []
+
+
+def test_tool_card_for_list_dir_renders_folder_tree(qapp, tmp_path: Path) -> None:
+    """list_dir cards must render a real QTreeWidget, not just text."""
+    from PySide6.QtWidgets import QTreeWidget
+
+    from devin_local.gui.widgets import ToolCard
+
+    raw = "dir         0  src\nfile      1234  README.md"
+    card = ToolCard("list_dir", {"path": "."}, workspace=tmp_path)
+    card.finish(ToolResult(ok=True, output=raw))
+    trees = card.findChildren(QTreeWidget)
+    assert len(trees) == 1
+    tree = trees[0]
+    assert tree.objectName() == "FolderTree"
+    # Top-level row count should match the number of parsed entries.
+    assert tree.topLevelItemCount() == 2
+
+
+def test_tool_card_for_find_files_groups_entries_by_directory(qapp, tmp_path: Path) -> None:
+    """find_files results that contain paths should group by parent dir so
+    the chat shows a real visual tree (not a flat list)."""
+    from PySide6.QtWidgets import QTreeWidget
+
+    from devin_local.gui.widgets import ToolCard
+
+    raw = "src/devin_local/cli.py\nsrc/devin_local/gui/app.py\nREADME.md"
+    card = ToolCard("find_files", {"pattern": "**/*.py", "root": "."}, workspace=tmp_path)
+    card.finish(ToolResult(ok=True, output=raw))
+    tree = card.findChildren(QTreeWidget)[0]
+    # 2 distinct parent directories ("src/devin_local", "src/devin_local/gui")
+    # plus 1 root-level entry (README.md) = at least 3 top-level rows.
+    top_texts = [tree.topLevelItem(i).text(0) for i in range(tree.topLevelItemCount())]
+    assert any("src/devin_local" in t for t in top_texts)
+    assert any("README.md" in t for t in top_texts)
+
+
+def test_tool_card_for_read_file_includes_path_meta(qapp, tmp_path: Path) -> None:
+    """read_file cards must show the path + a syntax-highlighted preview of
+    the returned contents (so users can see what the model actually read)."""
+    from devin_local.gui.syntax import CodeBlockWidget
+    from devin_local.gui.widgets import ToolCard
+
+    target = tmp_path / "hello.py"
+    target.write_text("print('hi')\n", encoding="utf-8")
+    card = ToolCard("read_file", {"path": "hello.py"}, workspace=tmp_path)
+    card.finish(ToolResult(ok=True, output="print('hi')\n"))
+    blocks = card.findChildren(CodeBlockWidget)
+    assert any("print" in b.code for b in blocks)
+
+
 def test_shutdown_agent_disconnects_request_submit_from_old_worker(qapp, tmp_path: Path) -> None:
     """_shutdown_agent must disconnect request_submit from the old worker's
     submit slot, otherwise each backend/workspace switch leaks the previous

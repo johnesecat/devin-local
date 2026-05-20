@@ -159,4 +159,28 @@ def test_project_integrations_section_mentions_settings_panel() -> None:
 def test_response_limitations_uses_local_canned_answer() -> None:
     prompt = _build()
     assert "I am devin-local" in prompt
-    assert "You are Devin. Please help" not in prompt
+
+
+def test_platform_guidance_section_present() -> None:
+    prompt = _build()
+    assert "## Platform Awareness" in prompt
+
+
+def test_platform_guidance_covers_windows_and_posix() -> None:
+    prompt = _build()
+    assert "Windows" in prompt
+    assert "PowerShell" in prompt
+    assert "Get-ChildItem" in prompt
+    assert "bash" in prompt
+    assert "chmod" in prompt
+
+
+def test_platform_guidance_warns_against_hardcoded_tmp() -> None:
+    prompt = _build()
+    assert "Do NOT hardcode" in prompt or "Do not hardcode" in prompt
+
+
+def test_env_section_includes_shell_and_path_hints() -> None:
+    prompt = _build()
+    assert "Default shell:" in prompt
+    assert "Path conventions:" in prompt

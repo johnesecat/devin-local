@@ -352,6 +352,55 @@ not loop back to refine cosmetics. The operator decides what's next.
 """
 
 
+PLATFORM_GUIDANCE = """\
+## Platform Awareness (Windows vs POSIX)
+
+The Environment section below tells you the actual OS the operator is
+on. Adapt your commands accordingly. devin-local is built primarily for
+Windows 10/11 but runs identically on Linux and macOS.
+
+**Windows-specific rules:**
+
+- The default shell for ``shell_exec`` on Windows is **PowerShell**
+  (``pwsh.exe`` or ``powershell.exe``), not bash. Use PowerShell idioms:
+  ``Get-ChildItem`` instead of ``ls -la``, ``Remove-Item`` instead of
+  ``rm``, ``Get-Content`` instead of ``cat``, ``$env:VAR = "x"`` instead
+  of ``export VAR=x``.
+- For cross-shell compatibility prefer the **file tools** (``read_file``,
+  ``write_file``, ``edit_file``, ``list_dir``, ``find_files``,
+  ``grep``) over shell utilities. They work the same on every OS.
+- Path separators: prefer **forward slashes** in tool arguments — Python's
+  ``pathlib`` handles them on Windows. If you must hand a path to a
+  Windows-native program, use backslashes and escape them in JSON
+  (``"C:\\\\Users\\\\me"``) or use raw strings inside ``python_exec``.
+- Do NOT hardcode ``/tmp``. Use ``%TEMP%`` on Windows or the workspace
+  path stamped into the Environment section below.
+- Do NOT call POSIX-only operations like ``chmod``, ``chown``, ``ln -s``
+  from shell. They will fail on Windows. If you need a symlink there,
+  use ``New-Item -ItemType SymbolicLink``.
+- Line endings: Python tooling handles ``\\r\\n`` vs ``\\n`` transparently;
+  do not strip ``\\r`` manually when reading files on Windows.
+- Path length: Windows has a 260-char default path limit. Keep workspace
+  paths short.
+
+**POSIX (Linux / macOS):**
+
+- Default shell is bash. Use bash idioms.
+- ``/tmp`` is available and writable. So is ``~``.
+- ``chmod``/``chown``/symlinks work normally.
+
+**Cross-platform safe defaults** (use these unless the operator says
+otherwise):
+
+- For temp files: write under ``<workspace>/.tmp/`` rather than ``/tmp``.
+- For Python invocation: ``python`` on Windows, ``python3`` on POSIX.
+  When unsure, do ``shell_exec`` with ``python --version`` first.
+- For installing deps: ``pip install ...`` works on both.
+- For pre-commit / lint / test commands: read ``README.md`` or
+  ``pyproject.toml`` for the canonical commands; do not guess.
+"""
+
+
 GIT_OPERATIONS = """\
 ## Git Operations
 
@@ -389,13 +438,25 @@ class PromptContext:
 
 
 def _env_section(workspace: Path, model: str, tools: list[str]) -> str:
+    os_name = platform.system()
+    if os_name == "Windows":
+        shell_hint = "PowerShell (pwsh.exe / powershell.exe). Use PowerShell idioms in shell_exec."
+        path_hint = (
+            "Use forward slashes in tool args; pathlib handles them. "
+            "Do NOT hardcode /tmp \u2014 use the workspace path above."
+        )
+    else:
+        shell_hint = "bash. Use POSIX idioms in shell_exec."
+        path_hint = "POSIX paths work as expected. /tmp is writable but prefer <workspace>/.tmp/."
     return (
         "## Environment\n"
-        f"- Operating system: {platform.system()} {platform.release()}\n"
+        f"- Operating system: {os_name} {platform.release()}\n"
         f"- Python: {sys.version.split()[0]}\n"
         f"- Workspace: {workspace}\n"
         f"- Backing model (Ollama): {model}\n"
         f"- Loaded tools: {', '.join(tools) if tools else '(none)'}\n"
+        f"- Default shell: {shell_hint}\n"
+        f"- Path conventions: {path_hint}\n"
         "- The user IS the operator of this machine; localhost URLs are\n"
         "  shareable with them directly.\n"
     )
@@ -417,6 +478,7 @@ def build_system_prompt(ctx: PromptContext) -> str:
         REASONING_DISCIPLINE,
         TOOL_USE_DISCIPLINE,
         PROJECT_INTEGRATIONS,
+        PLATFORM_GUIDANCE,
         GIT_OPERATIONS,
         COMPLETION,
         _env_section(ctx.workspace, ctx.model, ctx.tool_names),

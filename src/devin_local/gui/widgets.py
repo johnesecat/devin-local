@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QGuiApplication
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -36,6 +36,8 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QTextEdit,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -96,6 +98,9 @@ class MessageBubble(QFrame):
         self.role = role
         self.setObjectName("MessageBubbleUser" if role == "user" else "MessageBubbleAssistant")
         self.setFrameShape(QFrame.Shape.StyledPanel)
+        # Time-stamped at construction so the header chip is meaningful even
+        # when the bubble streams over many seconds.
+        self._created_at = time.localtime()
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(14, 12, 14, 12)
@@ -104,10 +109,20 @@ class MessageBubble(QFrame):
         header = QHBoxLayout()
         header.setContentsMargins(0, 0, 0, 0)
         header.setSpacing(8)
-        self._avatar = QLabel("You" if role == "user" else "devin-local")
-        self._avatar.setObjectName("BubbleAvatar")
+        avatar_text = "You" if role == "user" else "devin-local"
+        self._avatar = QLabel(avatar_text)
+        self._avatar.setObjectName("BubbleAvatarUser" if role == "user" else "BubbleAvatar")
         header.addWidget(self._avatar)
+        self._timestamp = QLabel(time.strftime("%H:%M", self._created_at))
+        self._timestamp.setObjectName("BubbleTimestamp")
+        header.addWidget(self._timestamp)
         header.addStretch(1)
+        self._copy_btn = QPushButton("Copy")
+        self._copy_btn.setObjectName("BubbleCopy")
+        self._copy_btn.setFlat(True)
+        self._copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._copy_btn.clicked.connect(self._copy_to_clipboard)
+        header.addWidget(self._copy_btn)
         outer.addLayout(header)
 
         # Container that holds the dynamic prose/code block children. Rebuilt
@@ -178,6 +193,12 @@ class MessageBubble(QFrame):
             if widget is not None:
                 widget.deleteLater()
 
+    def _copy_to_clipboard(self) -> None:
+        cb = QGuiApplication.clipboard()
+        if cb is not None:
+            cb.setText(self._raw_text)
+            self._copy_btn.setText("Copied")
+
 
 class _Pill(QLabel):
     """A small status pill (running / ok / error / warn)."""
@@ -232,8 +253,10 @@ class _Collapser(QWidget):
 class ToolCard(QFrame):
     """A collapsible card showing one tool invocation + its result."""
 
-    SHELL_TOOLS = {"shell_exec", "shell_session", "python"}
+    SHELL_TOOLS = {"shell_exec", "shell_session", "python", "python_exec"}
     WRITE_TOOLS = {"write_file", "edit_file"}
+    DIR_TOOLS = {"list_dir", "find_files"}
+    READ_TOOLS = {"read_file"}
 
     def __init__(
         self,
@@ -307,6 +330,10 @@ class ToolCard(QFrame):
         rc_layout = self._result_container.layout()
         if self._name in self.WRITE_TOOLS:
             self._add_write_result(rc_layout, result)
+        elif self._name in self.READ_TOOLS:
+            self._add_read_result(rc_layout, result)
+        elif self._name in self.DIR_TOOLS:
+            self._add_directory_result(rc_layout, result)
         elif self._name in self.SHELL_TOOLS:
             self._add_shell_result(rc_layout, result)
         else:
@@ -350,6 +377,53 @@ class ToolCard(QFrame):
     def _add_generic_result(self, layout: QVBoxLayout, result: ToolResult) -> None:
         payload = result.to_chat_payload()
         layout.addWidget(_Collapser("result", _result_text_widget(payload), expanded=False))
+
+    def _add_read_result(self, layout: QVBoxLayout, result: ToolResult) -> None:
+        """read_file: header with path, optional syntax-highlighted preview."""
+        path_str = _first_path_arg(self._arguments)
+        full_path = self._resolve(path_str) if path_str else None
+        meta_line = self._make_file_meta(full_path, path_str)
+        layout.addWidget(meta_line)
+        text = result.output or result.to_chat_payload()
+        lang = _lang_for_path(full_path) if full_path else ""
+        body_widget = CodeBlockWidget(lang, text)
+        layout.addWidget(_Collapser("contents", body_widget, expanded=False))
+
+    def _add_directory_result(self, layout: QVBoxLayout, result: ToolResult) -> None:
+        """list_dir / find_files: render a folder tree card."""
+        path_str = self._arguments.get("path") or self._arguments.get("root") or "."
+        pattern = self._arguments.get("pattern")
+        raw = result.output or result.to_chat_payload()
+        entries = _parse_directory_listing(raw, self._name)
+
+        meta = QWidget()
+        h = QHBoxLayout(meta)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(8)
+        icon_char = "\U0001f4c1"
+        label_text = (
+            f"{icon_char}  <code>{_escape_html(str(path_str))}</code>"
+            if not pattern
+            else f"{icon_char}  <code>{_escape_html(str(path_str))}</code>  \u00b7  pattern: <code>{_escape_html(str(pattern))}</code>"
+        )
+        path_label = QLabel(label_text)
+        path_label.setTextFormat(Qt.TextFormat.RichText)
+        path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        h.addWidget(path_label)
+        count_label = QLabel(f"{len(entries)} entry(ies)")
+        count_label.setObjectName("Muted")
+        h.addWidget(count_label)
+        h.addStretch(1)
+        layout.addWidget(meta)
+
+        if not entries:
+            empty = QLabel("(empty)")
+            empty.setObjectName("Muted")
+            layout.addWidget(empty)
+            return
+
+        tree = _FolderTreeWidget(entries)
+        layout.addWidget(_Collapser("entries", tree, expanded=True))
 
     # ---------- helpers ----------
 
@@ -644,3 +718,165 @@ def _result_text_widget(text: str) -> QWidget:
     body.setMinimumHeight(80)
     body.setMaximumHeight(360)
     return body
+
+
+# ---------- folder tree rendering ----------
+
+
+def parse_list_dir_output(text: str) -> list[tuple[str, str, int]]:
+    """Parse the output of ``list_dir`` into ``(kind, name, size)`` tuples.
+
+    ``list_dir`` returns lines like ``"dir         0  src"`` or
+    ``"file      1234  README.md"``. Returns an empty list for ``"(empty)"``.
+    """
+    entries: list[tuple[str, str, int]] = []
+    if not text or text.strip() == "(empty)":
+        return entries
+    for line in text.splitlines():
+        line = line.rstrip()
+        if not line:
+            continue
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        kind, size_str, name = parts[0], parts[1], parts[2]
+        if kind not in {"dir", "file"}:
+            continue
+        try:
+            size = int(size_str)
+        except ValueError:
+            size = 0
+        entries.append((kind, name, size))
+    return entries
+
+
+def parse_find_files_output(text: str) -> list[tuple[str, str, int]]:
+    """Parse the output of ``find_files`` into ``(kind, path, size)`` tuples.
+
+    ``find_files`` returns one workspace-relative file path per line.
+    """
+    entries: list[tuple[str, str, int]] = []
+    if not text or text.strip() == "(no matches)":
+        return entries
+    for line in text.splitlines():
+        path = line.strip()
+        if not path:
+            continue
+        entries.append(("file", path, 0))
+    return entries
+
+
+def _parse_directory_listing(text: str, tool_name: str) -> list[tuple[str, str, int]]:
+    if tool_name == "list_dir":
+        return parse_list_dir_output(text)
+    if tool_name == "find_files":
+        return parse_find_files_output(text)
+    return []
+
+
+class _FolderTreeWidget(QTreeWidget):
+    """A small tree view showing folder/file entries with icons + sizes.
+
+    For ``list_dir`` results we show a single flat level (the tool returns one
+    level). For ``find_files`` results we group by directory so the chat shows
+    a real visual tree of matched paths.
+    """
+
+    def __init__(self, entries: list[tuple[str, str, int]], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("FolderTree")
+        self.setHeaderHidden(True)
+        self.setRootIsDecorated(True)
+        self.setIndentation(14)
+        self.setUniformRowHeights(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        mono = QFont("JetBrains Mono", 10)
+        mono.setStyleHint(QFont.StyleHint.Monospace)
+        self.setFont(mono)
+        self._populate(entries)
+        # Height: roughly one row per visible item, capped at 12 rows.
+        row_h = max(18, self.fontMetrics().lineSpacing() + 4)
+        rows = min(12, max(1, self._visible_row_estimate(entries)))
+        self.setMinimumHeight(row_h * rows + 6)
+        self.setMaximumHeight(row_h * 14 + 6)
+
+    def _visible_row_estimate(self, entries: list[tuple[str, str, int]]) -> int:
+        # When the entries already contain "/" we'll group; count both dirs and
+        # files we'll show.
+        if any("/" in name or "\\" in name for _, name, _ in entries):
+            dirs: set[str] = set()
+            for _kind, name, _size in entries:
+                norm = name.replace("\\", "/")
+                head = norm.rsplit("/", 1)[0] if "/" in norm else ""
+                if head:
+                    dirs.add(head)
+            return len(entries) + len(dirs)
+        return len(entries)
+
+    def _populate(self, entries: list[tuple[str, str, int]]) -> None:
+        # Decide flat vs grouped based on whether any entries contain a path
+        # separator.
+        if any("/" in name or "\\" in name for _, name, _ in entries):
+            self._populate_grouped(entries)
+        else:
+            self._populate_flat(entries)
+        self.expandAll()
+
+    def _populate_flat(self, entries: list[tuple[str, str, int]]) -> None:
+        for kind, name, size in entries:
+            item = QTreeWidgetItem(self)
+            icon = "\U0001f4c1" if kind == "dir" else _file_glyph_for_name(name)
+            label = f"{icon}  {name}"
+            if kind == "file" and size > 0:
+                label += f"   {_human_bytes(size)}"
+            item.setText(0, label)
+
+    def _populate_grouped(self, entries: list[tuple[str, str, int]]) -> None:
+        # Group file paths by their parent directory; show parents as folder
+        # items, children indented underneath. Order parents alphabetically.
+        groups: dict[str, list[tuple[str, str, int]]] = {}
+        for kind, name, size in entries:
+            norm = name.replace("\\", "/")
+            if "/" in norm:
+                parent, leaf = norm.rsplit("/", 1)
+            else:
+                parent, leaf = "", norm
+            groups.setdefault(parent, []).append((kind, leaf, size))
+        for parent in sorted(groups.keys()):
+            if parent:
+                root = QTreeWidgetItem(self)
+                root.setText(0, f"\U0001f4c1  {parent}/")
+            else:
+                root = None
+            for kind, leaf, size in sorted(groups[parent], key=lambda x: x[1].lower()):
+                glyph = "\U0001f4c1" if kind == "dir" else _file_glyph_for_name(leaf)
+                label = f"{glyph}  {leaf}"
+                if kind == "file" and size > 0:
+                    label += f"   {_human_bytes(size)}"
+                if root is None:
+                    QTreeWidgetItem(self).setText(0, label)
+                else:
+                    child = QTreeWidgetItem(root)
+                    child.setText(0, label)
+
+
+def _file_glyph_for_name(name: str) -> str:
+    """Return a single-char glyph that hints the file kind based on extension."""
+    lower = name.lower()
+    if lower.endswith((".py",)):
+        return "\U0001f40d"  # python
+    if lower.endswith((".md", ".markdown", ".rst", ".txt")):
+        return "\U0001f4dd"  # memo
+    if lower.endswith((".json", ".yaml", ".yml", ".toml", ".ini")):
+        return "\u2699"  # gear (config)
+    if lower.endswith((".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp")):
+        return "\U0001f5bc"  # framed picture
+    if lower.endswith((".js", ".ts", ".tsx", ".jsx", ".mjs", ".cjs")):
+        return "\U0001f7e8"  # yellow square (web)
+    if lower.endswith((".rs",)):
+        return "\U0001f980"  # crab
+    if lower.endswith((".go",)):
+        return "\U0001f439"  # mouse (gopher-ish)
+    if lower.endswith((".sh", ".bash", ".zsh", ".ps1")):
+        return "\u25b6"  # play
+    return "\U0001f4c4"  # page
