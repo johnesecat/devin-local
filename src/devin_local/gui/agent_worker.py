@@ -9,6 +9,8 @@ connects slots to those signals.
 from __future__ import annotations
 
 import contextlib
+import threading
+import time
 from typing import Any
 
 from PySide6.QtCore import QObject, QThread, Signal, Slot
@@ -62,16 +64,16 @@ class AgentWorker(QObject):
         """Run one user turn. Must be invoked via QMetaObject.invokeMethod or
         a queued Qt connection because we'll touch the agent's mutable state.
         """
-        import time
-
         if not user_text.strip():
             return
         self.state_changed.emit("thinking")
         # Emit a "prefill 0.0s" right away so the GUI status bar flips out
-        # of "idle" the instant the operator hits Send — even if the model
-        # takes minutes before the first token, the operator sees we're
-        # waiting on it. Subsequent updates come from _on_chunk as tokens
-        # actually arrive (which is when we can compute real tok/s).
+        # of "idle" the instant the operator hits Send. A background ticker
+        # then re-emits the prefill stage every 250ms with the real elapsed
+        # time so the operator can SEE that prefill is still going (not
+        # stuck) — critical on CPU boxes where prefill can take minutes.
+        # The ticker stops on its own as soon as the first token arrives
+        # (which is when the generate stage takes over).
         self.progress_changed.emit("prefill", {"elapsed_s": 0.0})
 
         progress: dict[str, Any] = {
@@ -80,6 +82,23 @@ class AgentWorker(QObject):
             "tokens": 0,
             "last_emit": 0.0,
         }
+        ticker_stop = threading.Event()
+
+        def _prefill_ticker() -> None:
+            # Tick every 250ms; emits {"elapsed_s": float} so the status
+            # bar shows 'prefill 0.5s', 'prefill 0.7s', ... until the
+            # first token arrives (or the turn finishes / cancels).
+            while not ticker_stop.wait(0.25):
+                if progress["first_token_at"] is not None:
+                    return
+                self.progress_changed.emit(
+                    "prefill", {"elapsed_s": time.monotonic() - progress["start"]}
+                )
+
+        ticker_thread = threading.Thread(
+            target=_prefill_ticker, name="AgentWorker-prefill-ticker", daemon=True
+        )
+        ticker_thread.start()
 
         def _on_chunk(chunk: ChatChunk) -> None:
             if not chunk.done and chunk.delta:
@@ -122,6 +141,7 @@ class AgentWorker(QObject):
             start = progress["start"]
             turn = self.agent.handle_user(user_text, stream=self._stream_enabled)
             elapsed = time.monotonic() - start
+            ticker_stop.set()
             # Always emit a final "generate" snapshot so the status bar
             # shows a real tok/s ratio (the throttled in-stream snapshot
             # may be slightly stale).
@@ -149,6 +169,7 @@ class AgentWorker(QObject):
             self.error.emit(f"{type(exc).__name__}: {exc}")
             self.state_changed.emit("error")
         finally:
+            ticker_stop.set()
             self.progress_changed.emit("idle", {})
             with contextlib.suppress(ValueError):
                 self.agent._stream_observers.remove(_on_chunk)
