@@ -278,6 +278,79 @@ def test_tool_card_for_read_file_includes_path_meta(qapp, tmp_path: Path) -> Non
     assert any("print" in b.code for b in blocks)
 
 
+def test_ui_creator_dialog_has_figma_import_button(qapp, tmp_path: Path) -> None:
+    """The UI Creator's bottom button row must include an 'Import from Figma'
+    entry point so a Figma design can populate the canvas directly."""
+    from devin_local.ui_creator.dialog import UiCreatorDialog
+
+    dlg = UiCreatorDialog(workspace=tmp_path)
+    try:
+        assert hasattr(dlg, "_figma_btn")
+        assert "Figma" in dlg._figma_btn.text()
+    finally:
+        dlg.close()
+
+
+def test_ui_creator_open_from_main_window_uses_correct_module(qapp, tmp_path: Path) -> None:
+    """The main window's _open_ui_creator must import from devin_local.ui_creator,
+    not the (non-existent) devin_local.gui.ui_creator path."""
+    import inspect
+
+    src = inspect.getsource(MainWindow._open_ui_creator)
+    assert "from devin_local.ui_creator import UiCreatorDialog" in src
+    assert "from devin_local.gui.ui_creator import" not in src
+
+
+def test_settings_dialog_has_figma_tab(qapp) -> None:
+    """Settings dialog must include a Figma tab with PAT input + Import button."""
+    from devin_local.gui.settings_dialog import SettingsDialog
+
+    dlg = SettingsDialog()
+    try:
+        tab_names = [dlg._tabs.tabText(i) for i in range(dlg._tabs.count())]
+        assert "Figma" in tab_names
+        assert hasattr(dlg.figma_tab, "token")
+        assert hasattr(dlg.figma_tab, "import_btn")
+        assert hasattr(dlg.figma_tab, "test_btn")
+    finally:
+        dlg.close()
+
+
+def test_per_session_settings_round_trip(qapp, tmp_path: Path) -> None:
+    """PerSessionSettingsDialog must persist system_prompt_override + knowledge_dir
+    into the SessionInfo when the user saves, and that data must survive a
+    full save/load cycle through disk via SessionManager."""
+    from devin_local.gui.session_settings_dialog import PerSessionSettingsDialog
+    from devin_local.sessions import SessionManager
+    from devin_local.settings import Settings
+
+    mgr = SessionManager.for_workspace(tmp_path)
+    info = mgr.create(name="My session")
+    settings = Settings.load()
+    dlg = PerSessionSettingsDialog(info, settings)
+    try:
+        # Drive the dialog state as if the operator typed in the fields.
+        dlg._agent_tab.editor.setPlainText("YOU ARE A PIRATE.")
+        kb_dir = tmp_path / "kb"
+        dlg._knowledge_tab.path_edit.setText(str(kb_dir))
+        # Trigger the save flow and capture the emitted SessionInfo.
+        captured: list = []
+        dlg.session_saved.connect(lambda s: captured.append(s))
+        dlg._on_save()
+        assert captured, "session_saved did not fire"
+        updated = captured[0]
+        assert "PIRATE" in updated.system_prompt_override
+        assert updated.knowledge_dir == str(kb_dir)
+        # Roundtrip through disk too.
+        mgr.save(updated)
+        reloaded = mgr.load(updated.id)
+        assert reloaded is not None
+        assert "PIRATE" in reloaded.system_prompt_override
+        assert reloaded.knowledge_dir == str(kb_dir)
+    finally:
+        dlg.close()
+
+
 def test_shutdown_agent_disconnects_request_submit_from_old_worker(qapp, tmp_path: Path) -> None:
     """_shutdown_agent must disconnect request_submit from the old worker's
     submit slot, otherwise each backend/workspace switch leaks the previous
