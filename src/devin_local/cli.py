@@ -47,10 +47,19 @@ app.add_typer(knowledge_app, name="knowledge")
 
 
 def _console() -> Console:
-    """Build a console that handles Windows UTF-8 quirks."""
+    """Build a console that streams cleanly to TTYs *and* redirected files.
+
+    By default, Python buffers stdout when it isn't attached to a TTY (e.g.
+    when the user runs ``devin-local run > log.txt`` or under ``nohup``).
+    That makes streaming look broken because tokens accumulate in the
+    kernel buffer instead of arriving live. Force line-buffering so each
+    token delta flushes as soon as we print it.
+    """
     if sys.platform.startswith("win"):
         with contextlib.suppress(Exception):
             sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+    with contextlib.suppress(Exception):
+        sys.stdout.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
     return Console()
 
 
@@ -144,13 +153,20 @@ def _parse_keep_alive(raw: str | None) -> str | int | None:
 
 
 def _streaming_printer(console: Console):
-    """Return a stream-observer that prints token deltas live."""
+    """Return a stream-observer that prints token deltas live.
+
+    Explicitly flushes after every delta so output appears immediately even
+    when stdout is being redirected to a file / pipe (where Python's default
+    buffering would otherwise hold tokens until the buffer fills).
+    """
 
     def _emit(chunk: ChatChunk) -> None:
         if chunk.done:
             return
         if chunk.delta:
             console.print(chunk.delta, end="", soft_wrap=True, highlight=False)
+            with contextlib.suppress(Exception):
+                console.file.flush()
 
     return _emit
 
@@ -271,6 +287,21 @@ def models_suggest() -> None:
     )
 
 
+def _resolve_knowledge_store(workspace: Path, *, user: bool) -> Path:
+    """Return the JSONL path for the requested knowledge scope.
+
+    ``--user`` puts notes in ``~/.devin-local/knowledge/store.jsonl`` so they
+    persist across workspaces. Otherwise notes go in
+    ``<workspace>/knowledge/store.jsonl``. The agent embeds BOTH stores into
+    the system prompt at session start.
+    """
+    if user:
+        from devin_local.settings import user_knowledge_path
+
+        return user_knowledge_path()
+    return workspace / "knowledge" / "store.jsonl"
+
+
 @knowledge_app.command("add")
 def knowledge_add(
     title: str = typer.Argument(..., help="Short title for the note."),
@@ -279,6 +310,11 @@ def knowledge_add(
     scope: str = typer.Option("", help="Comma-separated scope hints."),
     tags: str = typer.Option("", help="Comma-separated tags."),
     workspace: Path = typer.Option(Path.cwd(), help="Workspace root."),
+    user: bool = typer.Option(
+        False,
+        "--user/--workspace",
+        help="Store in the cross-workspace user knowledge dir (~/.devin-local/knowledge).",
+    ),
 ) -> None:
     """Add a note to the knowledge store."""
     console = _console()
@@ -289,28 +325,35 @@ def knowledge_add(
     if not body.strip():
         console.print("[red]No body supplied.[/red]")
         raise typer.Exit(1)
-    store = KnowledgeStore.open(workspace / "knowledge" / "store.jsonl")
+    store = KnowledgeStore.open(_resolve_knowledge_store(workspace, user=user))
     note = store.add(
         title=title,
         body=body,
         scope=scope,
         tags=[t.strip() for t in tags.split(",") if t.strip()],
     )
-    console.print(f"Added note [bold]{note.id}[/bold]: {note.title}")
+    where = "user" if user else "workspace"
+    console.print(f"Added [{where}] note [bold]{note.id}[/bold]: {note.title}")
 
 
 @knowledge_app.command("list")
 def knowledge_list(
     workspace: Path = typer.Option(Path.cwd(), help="Workspace root."),
+    user: bool = typer.Option(
+        False,
+        "--user/--workspace",
+        help="List notes from the user knowledge store instead of the workspace store.",
+    ),
 ) -> None:
     """List stored notes."""
     console = _console()
-    store = KnowledgeStore.open(workspace / "knowledge" / "store.jsonl")
+    store = KnowledgeStore.open(_resolve_knowledge_store(workspace, user=user))
     notes = store.all()
     if not notes:
         console.print("(no notes)")
         return
-    table = Table(title=f"{len(notes)} knowledge note(s)")
+    where = "user" if user else "workspace"
+    table = Table(title=f"{len(notes)} {where} knowledge note(s)")
     table.add_column("ID")
     table.add_column("Title")
     table.add_column("Scope")

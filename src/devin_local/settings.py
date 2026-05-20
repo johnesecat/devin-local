@@ -188,6 +188,22 @@ def save_github(settings: GitHubSettings) -> Path:
     return path
 
 
+def user_knowledge_path() -> Path:
+    """Return the user-level (not workspace-scoped) knowledge store path.
+
+    Uploads made via the GUI's Settings → Knowledge tab land here so they
+    persist across workspaces. The Agent merges this store with the
+    workspace-local ``<workspace>/knowledge/store.jsonl`` at session start
+    and embeds both into the system prompt — they are NOT searched per
+    turn.
+    """
+    kdir = settings_dir() / "knowledge"
+    kdir.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError, NotImplementedError):
+        os.chmod(kdir, 0o700)
+    return kdir / "store.jsonl"
+
+
 def verify_github_pat(pat: str, *, timeout: float = 5.0) -> dict[str, Any]:
     """Hit ``GET /user`` with the PAT. Returns the decoded JSON on success.
 

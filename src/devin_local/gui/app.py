@@ -509,7 +509,21 @@ class MainWindow(QMainWindow):
 
         dlg = SettingsDialog(self)
         dlg.settings_saved.connect(self._on_settings_saved)
+        dlg.knowledge_changed.connect(self._on_knowledge_changed)
         dlg.exec()
+
+    def _on_knowledge_changed(self) -> None:
+        """Refresh the running agent's embedded knowledge (no restart needed)."""
+        if self._agent is None:
+            return
+        try:
+            self._agent.refresh_embedded_knowledge()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("refresh_embedded_knowledge failed: %s", exc)
+            return
+        self._chat.add_system_notice(
+            "Knowledge updated \u2014 embedded into the system prompt for subsequent turns."
+        )
 
     def _on_settings_saved(self, settings: object) -> None:
         from devin_local.settings import Settings

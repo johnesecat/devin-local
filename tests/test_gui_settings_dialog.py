@@ -30,7 +30,7 @@ def test_settings_dialog_has_all_tabs() -> None:
     from devin_local.gui.settings_dialog import SettingsDialog
 
     dlg = SettingsDialog()
-    expected = ["General", "MCP", "GitHub", "Backends", "Appearance"]
+    expected = ["General", "MCP", "GitHub", "Backends", "Knowledge", "Appearance"]
     actual = [dlg._tabs.tabText(i) for i in range(dlg._tabs.count())]
     assert actual == expected
 
@@ -95,3 +95,40 @@ def test_backends_tab_lists_three_backends() -> None:
 
     dlg = SettingsDialog()
     assert set(dlg.backends_tab._rows.keys()) == {"ollama", "layered", "hf"}
+
+
+def test_knowledge_tab_upload_file_persists_to_user_store(tmp_path: Path) -> None:
+    """Programmatic add via the Knowledge tab lands in the user knowledge store."""
+    _app()
+    from devin_local.gui.settings_dialog import SettingsDialog
+    from devin_local.knowledge.store import KnowledgeStore
+    from devin_local.settings import user_knowledge_path
+
+    dlg = SettingsDialog()
+    # Drive the tab's store directly (the QFileDialog is offscreen-unfriendly).
+    tab = dlg.knowledge_tab
+    tab._store.add(title="GUI upload", body="contents from uploaded file")
+    tab._refresh()
+    tab.knowledge_changed.emit()
+
+    # Item shows up in the list with the right title.
+    items = [tab.list.item(i).text() for i in range(tab.list.count())]
+    assert any("GUI upload" in t for t in items)
+
+    # And the underlying file persists for the next session.
+    persisted = KnowledgeStore.open(user_knowledge_path())
+    assert any(n.title == "GUI upload" for n in persisted.all())
+
+
+def test_knowledge_changed_signal_fires_on_add() -> None:
+    """Adding a note triggers ``SettingsDialog.knowledge_changed`` for the main window."""
+    _app()
+    from devin_local.gui.settings_dialog import SettingsDialog
+
+    dlg = SettingsDialog()
+    received: list[bool] = []
+    dlg.knowledge_changed.connect(lambda: received.append(True))
+    dlg.knowledge_tab._store.add(title="Note", body="body")
+    dlg.knowledge_tab._refresh()
+    dlg.knowledge_tab.knowledge_changed.emit()
+    assert received == [True]

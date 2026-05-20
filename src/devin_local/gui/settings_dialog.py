@@ -30,11 +30,13 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QTabWidget,
     QVBoxLayout,
@@ -43,6 +45,7 @@ from PySide6.QtWidgets import (
 
 from devin_local.gui.backend_installer import backend_dep_probe
 from devin_local.gui.icons import icon
+from devin_local.knowledge.store import KnowledgeStore
 from devin_local.settings import (
     MCPServer,
     Settings,
@@ -50,6 +53,7 @@ from devin_local.settings import (
     load_mcp_servers,
     save_github,
     save_mcp_servers,
+    user_knowledge_path,
     verify_github_pat,
 )
 
@@ -417,6 +421,190 @@ class _BackendsTab(QWidget):
         pass
 
 
+class _AddNoteDialog(QDialog):
+    """Compose a single knowledge note (title + body + scope/tags)."""
+
+    def __init__(self, parent: QWidget | None = None, *, title: str = "", body: str = "") -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Add knowledge note")
+        self.setMinimumSize(560, 420)
+        form = QFormLayout()
+        self.title_edit = QLineEdit(title)
+        self.title_edit.setPlaceholderText("Short title — e.g. 'Project build commands'")
+        self.scope_edit = QLineEdit()
+        self.scope_edit.setPlaceholderText("Comma-separated hints — e.g. 'rust, build, ci'")
+        self.tags_edit = QLineEdit()
+        self.tags_edit.setPlaceholderText("Comma-separated tags")
+        self.body_edit = QPlainTextEdit(body)
+        self.body_edit.setPlaceholderText(
+            "Paste the knowledge content. Markdown is fine — it will be embedded "
+            "verbatim into the system prompt at session start."
+        )
+        form.addRow("Title", self.title_edit)
+        form.addRow("Scope", self.scope_edit)
+        form.addRow("Tags", self.tags_edit)
+        form.addRow("Body", self.body_edit)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form, 1)
+        layout.addWidget(buttons)
+
+    def values(self) -> tuple[str, str, str, list[str]]:
+        tags_raw = self.tags_edit.text().strip()
+        tags = [t.strip() for t in tags_raw.split(",") if t.strip()]
+        return (
+            self.title_edit.text().strip() or "Untitled",
+            self.body_edit.toPlainText().strip(),
+            self.scope_edit.text().strip(),
+            tags,
+        )
+
+
+class _KnowledgeTab(QWidget):
+    """Manage the user-level knowledge store (``~/.devin-local/knowledge``).
+
+    Everything here is embedded into the system prompt at session start, so
+    the agent does NOT need to re-search this corpus per turn. Users can
+    upload files, paste text, or remove notes — changes apply on the next
+    agent turn.
+    """
+
+    knowledge_changed = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._store = KnowledgeStore.open(user_knowledge_path())
+
+        layout = QVBoxLayout(self)
+        hint = QLabel(
+            "Knowledge notes are embedded directly into the agent's system "
+            "prompt at session start. The agent does NOT re-search this "
+            "corpus on every turn — that saves tokens and keeps responses "
+            "fast. Upload anything you want the agent to remember across "
+            "sessions: project conventions, API keys to NOT touch, build "
+            "commands, runbooks, etc."
+        )
+        hint.setObjectName("Hint")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.list = QListWidget()
+        self.list.setObjectName("KnowledgeList")
+        self.list.setSelectionMode(self.list.SelectionMode.SingleSelection)
+        layout.addWidget(self.list, 1)
+
+        button_row = QHBoxLayout()
+        self.upload_btn = QPushButton("Upload file…")
+        self.upload_btn.clicked.connect(self._on_upload_file)
+        self.paste_btn = QPushButton("Add text…")
+        self.paste_btn.clicked.connect(self._on_add_text)
+        self.delete_btn = QPushButton("Delete")
+        self.delete_btn.clicked.connect(self._on_delete)
+        self.delete_btn.setEnabled(False)
+        button_row.addWidget(self.upload_btn)
+        button_row.addWidget(self.paste_btn)
+        button_row.addStretch(1)
+        button_row.addWidget(self.delete_btn)
+        layout.addLayout(button_row)
+
+        self.usage_label = QLabel()
+        self.usage_label.setObjectName("Hint")
+        layout.addWidget(self.usage_label)
+
+        self.list.itemSelectionChanged.connect(self._on_selection_changed)
+        self._refresh()
+
+    def _refresh(self) -> None:
+        self.list.clear()
+        total_chars = 0
+        for note in self._store.all():
+            item = QListWidgetItem(self._format_item_label(note))
+            item.setData(Qt.ItemDataRole.UserRole, note.id)
+            self.list.addItem(item)
+            total_chars += len(note.body)
+        self.usage_label.setText(
+            f"{len(self._store.all())} note(s) · {total_chars:,} chars total "
+            f"(embedded into every new session's system prompt)"
+        )
+
+    @staticmethod
+    def _format_item_label(note) -> str:  # noqa: ANN001 - KnowledgeNote
+        scope = f" — scope: {note.scope}" if note.scope else ""
+        size = len(note.body)
+        return f"{note.title}{scope}  ({size:,} chars)"
+
+    def _on_selection_changed(self) -> None:
+        self.delete_btn.setEnabled(bool(self.list.selectedItems()))
+
+    def _on_upload_file(self) -> None:
+        chosen, _ = QFileDialog.getOpenFileName(
+            self,
+            "Upload knowledge file",
+            "",
+            "Text files (*.md *.txt *.rst *.json *.yaml *.yml);;All files (*)",
+        )
+        if not chosen:
+            return
+        try:
+            with open(chosen, encoding="utf-8", errors="replace") as fh:
+                body = fh.read()
+        except OSError as exc:
+            QMessageBox.warning(self, "Upload failed", f"Could not read file:\n{exc}")
+            return
+        from pathlib import Path as _Path
+
+        # Default title from the filename — user can change it via "Add text".
+        default_title = _Path(chosen).stem
+        title, ok = QInputDialog.getText(
+            self,
+            "Note title",
+            "Title for this knowledge note:",
+            text=default_title,
+        )
+        if not ok or not title.strip():
+            return
+        self._store.add(title=title.strip(), body=body)
+        self._refresh()
+        self.knowledge_changed.emit()
+
+    def _on_add_text(self) -> None:
+        dlg = _AddNoteDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        title, body, scope, tags = dlg.values()
+        if not body.strip():
+            QMessageBox.information(self, "Empty", "Body is empty — nothing saved.")
+            return
+        self._store.add(title=title, body=body, scope=scope, tags=tags)
+        self._refresh()
+        self.knowledge_changed.emit()
+
+    def _on_delete(self) -> None:
+        item = self.list.currentItem()
+        if item is None:
+            return
+        note_id = item.data(Qt.ItemDataRole.UserRole)
+        confirmed = QMessageBox.question(
+            self,
+            "Delete note",
+            f"Delete '{item.text()}'? This is permanent.",
+        )
+        if confirmed != QMessageBox.StandardButton.Yes:
+            return
+        if self._store.remove(note_id):
+            self._refresh()
+            self.knowledge_changed.emit()
+
+    def apply(self) -> None:  # no-op; we persist on every action.
+        pass
+
+
 class _AppearanceTab(QWidget):
     def __init__(self, settings: Settings, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -457,11 +645,12 @@ class SettingsDialog(QDialog):
     """Multi-tab settings dialog. Returns ``QDialog.Accepted`` on save."""
 
     settings_saved = Signal(object)  # emits the new Settings instance
+    knowledge_changed = Signal()  # re-emitted from the Knowledge tab
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.setMinimumSize(640, 520)
+        self.setMinimumSize(680, 560)
         self._settings = Settings.load()
         self._tabs = QTabWidget()
 
@@ -469,13 +658,17 @@ class SettingsDialog(QDialog):
         self.mcp_tab = _MCPTab()
         self.github_tab = _GitHubTab()
         self.backends_tab = _BackendsTab()
+        self.knowledge_tab = _KnowledgeTab()
         self.appearance_tab = _AppearanceTab(self._settings)
+        # Re-emit so the main window can refresh the running agent's prompt.
+        self.knowledge_tab.knowledge_changed.connect(self.knowledge_changed)
 
         for name, widget, icon_name in (
             ("General", self.general_tab, "general"),
             ("MCP", self.mcp_tab, "mcp"),
             ("GitHub", self.github_tab, "github"),
             ("Backends", self.backends_tab, "backend"),
+            ("Knowledge", self.knowledge_tab, "general"),
             ("Appearance", self.appearance_tab, "appearance"),
         ):
             ico = icon(icon_name)
@@ -501,6 +694,7 @@ class SettingsDialog(QDialog):
         self.mcp_tab.apply()
         self.github_tab.apply()
         self.backends_tab.apply()
+        self.knowledge_tab.apply()
         self.settings_saved.emit(self._settings)
         self.accept()
 

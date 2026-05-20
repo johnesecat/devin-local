@@ -68,6 +68,18 @@ class AgentConfig:
     enable_plugins: bool = True
     enable_knowledge_injection: bool = True
     enable_skill_injection: bool = True
+    # When True (default) the agent loads ALL user + workspace knowledge
+    # notes and ALL matching skills into the system prompt ONCE at session
+    # start, instead of running a TF-IDF search every turn. This is faster,
+    # cheaper on tokens (because the system prompt is cached on the model
+    # side), and lets users upload knowledge from the GUI Settings tab
+    # knowing it will stay embedded for the whole session.
+    embed_all_knowledge: bool = True
+    # Soft cap on how many characters of knowledge to inline into the
+    # system prompt. The agent truncates the lowest-priority notes if it
+    # would otherwise blow past this. Default 200k chars (~50k tokens) is
+    # well under llama3.1:8b's 131k-token context window.
+    max_embedded_knowledge_chars: int = 200_000
     temperature: float = 0.2
     session_path: Path | None = None
     num_ctx: int | None = None  # override the backend's context window
@@ -130,6 +142,14 @@ class Agent:
             enable_browser=config.enable_browser,
         )
         self.knowledge = KnowledgeStore.open(self.workspace / "knowledge" / "store.jsonl")
+        # User-level (cross-workspace) knowledge store: GUI uploads land here.
+        try:
+            from devin_local.settings import user_knowledge_path
+
+            user_path = user_knowledge_path()
+        except Exception:  # noqa: BLE001 - settings dir not writable; fall back.
+            user_path = self.workspace / ".devin-local-user-knowledge.jsonl"
+        self.user_knowledge = KnowledgeStore.open(user_path)
         self.skills: SkillLoader = load_default_skills(self.workspace)
         self.mcp_manager: MCPClientManager | None = None
         self.system_prompt_sections: list[str] = []
@@ -150,6 +170,9 @@ class Agent:
         self._initialized = False
         self._cached_system_prompt: str | None = None
         self._cached_tool_names_snapshot: tuple[str, ...] | None = None
+        # Full cache key: (tool_names, knowledge_snapshot, skill_snapshot).
+        # Invalidates the cached system prompt whenever any of those change.
+        self._cached_prompt_cache_key: tuple[Any, ...] | None = None
 
     # ---------- public API ----------
 
@@ -182,6 +205,25 @@ class Agent:
             self._connect_mcp()
         self._ensure_system_prompt()
         self._initialized = True
+
+    def refresh_embedded_knowledge(self) -> None:
+        """Re-read the knowledge stores from disk and rebuild the system prompt.
+
+        Called by the GUI's Settings → Knowledge tab after the user uploads,
+        edits, or deletes notes so the change is visible without restarting
+        the session. The very next ``handle_user`` will use the new prompt.
+        """
+        # Refresh both stores from disk.
+        self.knowledge = KnowledgeStore.open(self.knowledge.path)
+        self.user_knowledge = KnowledgeStore.open(self.user_knowledge.path)
+        # Reload skills too — they're cheap to scan.
+        self.skills.reload()
+        # Drop the old system message; _ensure_system_prompt will rebuild.
+        if self.messages and self.messages[0].role == "system":
+            self.messages.pop(0)
+        self._cached_system_prompt = None
+        self._cached_prompt_cache_key = None
+        self._ensure_system_prompt()
 
     def shutdown(self) -> None:
         """Tear down MCP, terminals, and the inference backend."""
@@ -391,29 +433,95 @@ class Agent:
         # Cache the system prompt: tools and skills are stable across turns,
         # so rebuilding the prompt every turn just wastes CPU and (worse)
         # changes the prompt-cache hash on the backend, defeating Ollama's
-        # KV cache. Only rebuild when the tool set changes.
+        # KV cache. Only rebuild when the tool set, knowledge, or skill
+        # snapshot changes.
         tool_names = tuple(self.registry.names())
-        if self._cached_system_prompt is None or self._cached_tool_names_snapshot != tool_names:
+        knowledge_snapshot = self._knowledge_snapshot()
+        skill_snapshot = self._skill_snapshot()
+        cache_key = (tool_names, knowledge_snapshot, skill_snapshot)
+        if self._cached_system_prompt is None or self._cached_prompt_cache_key != cache_key:
+            knowledge_blocks = self._collect_knowledge_blocks()
+            skill_blocks = self._collect_skill_blocks()
             ctx = PromptContext(
                 workspace=self.workspace,
                 model=self.config.model,
                 tool_names=list(tool_names),
+                knowledge_blocks=knowledge_blocks,
+                skill_blocks=skill_blocks,
                 enable_obliteratus=self.config.enable_obliteratus,
                 extra_sections=self.system_prompt_sections,
             )
             self._cached_system_prompt = build_system_prompt(ctx)
+            self._cached_prompt_cache_key = cache_key
             self._cached_tool_names_snapshot = tool_names
         self.messages.insert(0, ChatMessage(role="system", content=self._cached_system_prompt))
         if self.session is not None:
             self.session.replace_all(self.messages)
 
+    def _knowledge_snapshot(self) -> tuple[str, ...]:
+        """Stable identity of the knowledge corpus, used to invalidate cache."""
+        if not self.config.embed_all_knowledge or not self.config.enable_knowledge_injection:
+            return ()
+        ids: list[str] = []
+        for note in self.knowledge.all():
+            ids.append(f"ws:{note.id}")
+        for note in self.user_knowledge.all():
+            ids.append(f"user:{note.id}")
+        return tuple(sorted(ids))
+
+    def _skill_snapshot(self) -> tuple[str, ...]:
+        if not self.config.enable_skill_injection:
+            return ()
+        return tuple(sorted(s.name for s in self.skills.skills))
+
+    def _collect_knowledge_blocks(self) -> list[str]:
+        """Return all knowledge notes as ``to_block()`` strings, capped by
+        :attr:`AgentConfig.max_embedded_knowledge_chars`.
+        """
+        if not self.config.embed_all_knowledge or not self.config.enable_knowledge_injection:
+            return []
+        # Workspace notes take priority (more specific), then user notes.
+        ordered = list(self.knowledge.all()) + list(self.user_knowledge.all())
+        blocks: list[str] = []
+        used = 0
+        cap = max(0, self.config.max_embedded_knowledge_chars)
+        for note in ordered:
+            block = note.to_block()
+            if cap and used + len(block) > cap:
+                # Stop adding once we'd blow the soft cap; do not silently
+                # truncate mid-note (would corrupt structure).
+                continue
+            blocks.append(block)
+            used += len(block)
+        return blocks
+
+    def _collect_skill_blocks(self) -> list[str]:
+        """Return all skill bodies as blocks when ``embed_all_knowledge`` is on."""
+        if not self.config.embed_all_knowledge or not self.config.enable_skill_injection:
+            return []
+        return [s.to_block() for s in self.skills.skills]
+
     def _inject_relevant_context(self, query: str) -> None:
-        """Insert top-K knowledge notes + matching skills before the user turn."""
+        """Insert top-K knowledge notes + matching skills before the user turn.
+
+        When :attr:`AgentConfig.embed_all_knowledge` is ``True`` (the default)
+        the agent has already inlined every note + skill into the cached
+        system prompt, so this method is a no-op — that's the whole point of
+        embed-once: avoid re-searching the corpus every turn.
+
+        It still runs in legacy mode (``embed_all_knowledge=False``), where
+        callers want classic per-turn TF-IDF retrieval (useful when the
+        corpus is too large to inline).
+        """
+        if self.config.embed_all_knowledge:
+            return
         if not (self.config.enable_knowledge_injection or self.config.enable_skill_injection):
             return
         injections: list[str] = []
         if self.config.enable_knowledge_injection:
-            notes = self.knowledge.search(query, k=3)
+            ws_notes = self.knowledge.search(query, k=3)
+            user_notes = self.user_knowledge.search(query, k=3)
+            notes = ws_notes + [n for n in user_notes if n not in ws_notes]
             if notes:
                 injections.append(
                     "<retrieved-knowledge>\n"
