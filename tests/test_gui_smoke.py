@@ -52,6 +52,35 @@ def test_chat_pane_renders_tool_card(qapp, tmp_path: Path) -> None:
     card.finish(ToolResult(ok=True, output='{"ok": true}'))
 
 
+def test_chat_pane_has_dark_theme_object_names(qapp) -> None:
+    """Regression for the 'beige chat under dark sidebar' bug.
+
+    The ChatPane viewport must carry the object names referenced by the
+    theme stylesheet so the dark ``bg_0`` rule actually matches it.
+    Without these the QScrollArea viewport defaults to a near-white system
+    color and the chat looks mismatched with the rest of the dark UI.
+    """
+    pane = ChatPane()
+    assert pane.objectName() == "ChatPane"
+    container = pane.widget()
+    assert container is not None
+    assert container.objectName() == "ChatPaneContainer"
+    viewport = pane.viewport()
+    assert viewport is not None
+    assert viewport.objectName() == "ChatPaneViewport"
+
+
+def test_chat_pane_theme_rule_targets_object_names() -> None:
+    """The dark theme stylesheet must contain a rule that matches the
+    ChatPane's object names — otherwise setting them on the widget is a
+    no-op."""
+    from devin_local.gui.theme import stylesheet
+
+    css = stylesheet()
+    assert "QScrollArea#ChatPane" in css
+    assert "ChatPaneContainer" in css or "ChatPaneViewport" in css
+
+
 def test_message_bubble_renders_code_blocks(qapp, tmp_path: Path) -> None:
     """A bubble with a ```lang fenced block should split it into a dedicated
     code-block child widget (so syntax highlighting + copy button can apply).
@@ -167,6 +196,245 @@ def test_main_window_builds_and_lists_all_backends(qapp, tmp_path: Path) -> None
         assert "devin-local" in win.windowTitle()
     finally:
         win.close()
+
+
+def test_message_bubble_has_copy_button_timestamp_and_role(qapp) -> None:
+    """The polished assistant bubble must surface a role label, timestamp,
+    and a copy-on-hover button so the user can grab the response cleanly."""
+    from devin_local.gui.widgets import MessageBubble
+
+    bubble = MessageBubble("assistant", "hello")
+    assert bubble._avatar.text() == "devin-local"
+    # HH:MM is 5 chars; allow either to permit single-digit hours.
+    assert len(bubble._timestamp.text()) in (4, 5)
+    assert bubble._copy_btn.text() == "Copy"
+    bubble._copy_to_clipboard()
+    assert bubble._copy_btn.text() == "Copied"
+
+
+def test_message_bubble_user_role_uses_user_avatar(qapp) -> None:
+    from devin_local.gui.widgets import MessageBubble
+
+    bubble = MessageBubble("user", "do the thing")
+    assert bubble._avatar.text() == "You"
+    assert bubble._avatar.objectName() == "BubbleAvatarUser"
+
+
+def test_parse_list_dir_output_handles_files_and_dirs() -> None:
+    """The chat tree-card depends on parsing list_dir output reliably."""
+    from devin_local.gui.widgets import parse_list_dir_output
+
+    raw = "dir         0  src\nfile      1234  README.md\nfile        12  .gitignore"
+    entries = parse_list_dir_output(raw)
+    assert entries == [
+        ("dir", "src", 0),
+        ("file", "README.md", 1234),
+        ("file", ".gitignore", 12),
+    ]
+
+
+def test_parse_list_dir_output_handles_empty_marker() -> None:
+    from devin_local.gui.widgets import parse_list_dir_output
+
+    assert parse_list_dir_output("(empty)") == []
+    assert parse_list_dir_output("") == []
+
+
+def test_parse_find_files_output_returns_file_entries() -> None:
+    from devin_local.gui.widgets import parse_find_files_output
+
+    raw = "src/devin_local/cli.py\nsrc/devin_local/gui/app.py\nREADME.md"
+    entries = parse_find_files_output(raw)
+    assert entries == [
+        ("file", "src/devin_local/cli.py", 0),
+        ("file", "src/devin_local/gui/app.py", 0),
+        ("file", "README.md", 0),
+    ]
+
+
+def test_parse_find_files_output_handles_no_matches() -> None:
+    from devin_local.gui.widgets import parse_find_files_output
+
+    assert parse_find_files_output("(no matches)") == []
+
+
+def test_tool_card_for_list_dir_renders_folder_tree(qapp, tmp_path: Path) -> None:
+    """list_dir cards must render a real QTreeWidget, not just text."""
+    from PySide6.QtWidgets import QTreeWidget
+
+    from devin_local.gui.widgets import ToolCard
+
+    raw = "dir         0  src\nfile      1234  README.md"
+    card = ToolCard("list_dir", {"path": "."}, workspace=tmp_path)
+    card.finish(ToolResult(ok=True, output=raw))
+    trees = card.findChildren(QTreeWidget)
+    assert len(trees) == 1
+    tree = trees[0]
+    assert tree.objectName() == "FolderTree"
+    # Top-level row count should match the number of parsed entries.
+    assert tree.topLevelItemCount() == 2
+
+
+def test_tool_card_for_find_files_groups_entries_by_directory(qapp, tmp_path: Path) -> None:
+    """find_files results that contain paths should group by parent dir so
+    the chat shows a real visual tree (not a flat list)."""
+    from PySide6.QtWidgets import QTreeWidget
+
+    from devin_local.gui.widgets import ToolCard
+
+    raw = "src/devin_local/cli.py\nsrc/devin_local/gui/app.py\nREADME.md"
+    card = ToolCard("find_files", {"pattern": "**/*.py", "root": "."}, workspace=tmp_path)
+    card.finish(ToolResult(ok=True, output=raw))
+    tree = card.findChildren(QTreeWidget)[0]
+    # 2 distinct parent directories ("src/devin_local", "src/devin_local/gui")
+    # plus 1 root-level entry (README.md) = at least 3 top-level rows.
+    top_texts = [tree.topLevelItem(i).text(0) for i in range(tree.topLevelItemCount())]
+    assert any("src/devin_local" in t for t in top_texts)
+    assert any("README.md" in t for t in top_texts)
+
+
+def test_tool_card_for_read_file_includes_path_meta(qapp, tmp_path: Path) -> None:
+    """read_file cards must show the path + a syntax-highlighted preview of
+    the returned contents (so users can see what the model actually read)."""
+    from devin_local.gui.syntax import CodeBlockWidget
+    from devin_local.gui.widgets import ToolCard
+
+    target = tmp_path / "hello.py"
+    target.write_text("print('hi')\n", encoding="utf-8")
+    card = ToolCard("read_file", {"path": "hello.py"}, workspace=tmp_path)
+    card.finish(ToolResult(ok=True, output="print('hi')\n"))
+    blocks = card.findChildren(CodeBlockWidget)
+    assert any("print" in b.code for b in blocks)
+
+
+def test_ui_creator_dialog_has_figma_import_button(qapp, tmp_path: Path) -> None:
+    """The UI Creator's bottom button row must include an 'Import from Figma'
+    entry point so a Figma design can populate the canvas directly."""
+    from devin_local.ui_creator.dialog import UiCreatorDialog
+
+    dlg = UiCreatorDialog(workspace=tmp_path)
+    try:
+        assert hasattr(dlg, "_figma_btn")
+        assert "Figma" in dlg._figma_btn.text()
+    finally:
+        dlg.close()
+
+
+def test_ui_creator_open_from_main_window_uses_correct_module(qapp, tmp_path: Path) -> None:
+    """The main window's _open_ui_creator must import from devin_local.ui_creator,
+    not the (non-existent) devin_local.gui.ui_creator path."""
+    import inspect
+
+    src = inspect.getsource(MainWindow._open_ui_creator)
+    assert "from devin_local.ui_creator import UiCreatorDialog" in src
+    assert "from devin_local.gui.ui_creator import" not in src
+
+
+def test_settings_dialog_has_figma_tab(qapp) -> None:
+    """Settings dialog must include a Figma tab with PAT input + Import button."""
+    from devin_local.gui.settings_dialog import SettingsDialog
+
+    dlg = SettingsDialog()
+    try:
+        tab_names = [dlg._tabs.tabText(i) for i in range(dlg._tabs.count())]
+        assert "Figma" in tab_names
+        assert hasattr(dlg.figma_tab, "token")
+        assert hasattr(dlg.figma_tab, "import_btn")
+        assert hasattr(dlg.figma_tab, "test_btn")
+    finally:
+        dlg.close()
+
+
+def test_per_session_settings_round_trip(qapp, tmp_path: Path) -> None:
+    """PerSessionSettingsDialog must persist system_prompt_override + knowledge_dir
+    into the SessionInfo when the user saves, and that data must survive a
+    full save/load cycle through disk via SessionManager."""
+    from devin_local.gui.session_settings_dialog import PerSessionSettingsDialog
+    from devin_local.sessions import SessionManager
+    from devin_local.settings import Settings
+
+    mgr = SessionManager.for_workspace(tmp_path)
+    info = mgr.create(name="My session")
+    settings = Settings.load()
+    dlg = PerSessionSettingsDialog(info, settings)
+    try:
+        # Drive the dialog state as if the operator typed in the fields.
+        dlg._agent_tab.editor.setPlainText("YOU ARE A PIRATE.")
+        kb_dir = tmp_path / "kb"
+        dlg._knowledge_tab.path_edit.setText(str(kb_dir))
+        # Trigger the save flow and capture the emitted SessionInfo.
+        captured: list = []
+        dlg.session_saved.connect(lambda s: captured.append(s))
+        dlg._on_save()
+        assert captured, "session_saved did not fire"
+        updated = captured[0]
+        assert "PIRATE" in updated.system_prompt_override
+        assert updated.knowledge_dir == str(kb_dir)
+        # Roundtrip through disk too.
+        mgr.save(updated)
+        reloaded = mgr.load(updated.id)
+        assert reloaded is not None
+        assert "PIRATE" in reloaded.system_prompt_override
+        assert reloaded.knowledge_dir == str(kb_dir)
+    finally:
+        dlg.close()
+
+
+def test_per_session_verbose_prompt_toggle_round_trips(qapp, tmp_path: Path) -> None:
+    """The Behavior tab's 'Verbose system prompt' override must round-trip
+    through SessionInfo so the slim/verbose choice actually persists."""
+    from devin_local.gui.session_settings_dialog import PerSessionSettingsDialog
+    from devin_local.sessions import SessionManager
+    from devin_local.settings import Settings
+
+    mgr = SessionManager.for_workspace(tmp_path)
+    info = mgr.create(name="Verbose session")
+    settings = Settings.load()
+    dlg = PerSessionSettingsDialog(info, settings)
+    try:
+        # Default: not overridden -> None.
+        assert dlg._behavior_tab.values()["verbose_prompt"] is None
+        # Flip the override on and check the value.
+        dlg._behavior_tab._verbose_row._cb.setChecked(True)
+        dlg._behavior_tab._verbose_cb.setChecked(True)
+        assert dlg._behavior_tab.values()["verbose_prompt"] is True
+        captured: list = []
+        dlg.session_saved.connect(lambda s: captured.append(s))
+        dlg._on_save()
+        assert captured
+        assert captured[0].verbose_prompt is True
+        # Roundtrip through disk.
+        mgr.save(captured[0])
+        reloaded = mgr.load(captured[0].id)
+        assert reloaded is not None
+        assert reloaded.verbose_prompt is True
+    finally:
+        dlg.close()
+
+
+def test_settings_dialog_tools_tab_lists_user_tool_files(qapp, tmp_path: Path, monkeypatch) -> None:
+    """Settings → Tools tab must list user-defined .py tool files and call
+    ``register_user_tools`` on the running agent when the user clicks
+    'Reload'. This test only covers the listing behavior; the agent-side
+    reload is covered by test_user_tools.py."""
+    from devin_local.gui.settings_dialog import SettingsDialog
+
+    monkeypatch.setenv("DEVIN_LOCAL_HOME", str(tmp_path / "home"))
+    tools_dir = tmp_path / "home" / "tools"
+    tools_dir.mkdir(parents=True)
+    (tools_dir / "wordcount.py").write_text(
+        "from devin_local.tools.user_tools import tool\n\n"
+        '@tool(name="wordcount", description="count words")\n'
+        "def wordcount(args):\n"
+        '    return str(len(args.get("text", "").split()))\n',
+        encoding="utf-8",
+    )
+    dlg = SettingsDialog()
+    try:
+        items = [dlg.tools_tab._list.item(i).text() for i in range(dlg.tools_tab._list.count())]
+        assert any("wordcount.py" in t and "wordcount" in t for t in items)
+    finally:
+        dlg.close()
 
 
 def test_shutdown_agent_disconnects_request_submit_from_old_worker(qapp, tmp_path: Path) -> None:

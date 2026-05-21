@@ -9,6 +9,8 @@ connects slots to those signals.
 from __future__ import annotations
 
 import contextlib
+import threading
+import time
 from typing import Any
 
 from PySide6.QtCore import QObject, QThread, Signal, Slot
@@ -37,7 +39,16 @@ class AgentWorker(QObject):
     plan_updated = Signal(object)  # Plan
     turn_finished = Signal(str, int, float)
     error = Signal(str)
-    state_changed = Signal(str)  # "idle" | "thinking" | "tool" | "error"
+    state_changed = Signal(str)  # "idle" | "thinking" | "tool" | "error" | "cancelled"
+    cancelled = Signal()
+    # Live progress for the in-flight turn. ``stage`` is one of:
+    #   "prefill"  — request sent, no tokens yet. info = {"elapsed_s": float}
+    #   "generate" — tokens flowing. info = {"tokens": int, "tok_s": float,
+    #                "elapsed_s": float}
+    #   "done"     — turn complete. info = {"prompt_tokens": int,
+    #                "completion_tokens": int, "elapsed_s": float}
+    #   "idle"     — composer reset, clear any progress text.
+    progress_changed = Signal(str, dict)
 
     def __init__(self, agent: Agent) -> None:
         super().__init__()
@@ -53,15 +64,64 @@ class AgentWorker(QObject):
         """Run one user turn. Must be invoked via QMetaObject.invokeMethod or
         a queued Qt connection because we'll touch the agent's mutable state.
         """
-        import time
-
         if not user_text.strip():
             return
         self.state_changed.emit("thinking")
+        # Emit a "prefill 0.0s" right away so the GUI status bar flips out
+        # of "idle" the instant the operator hits Send. A background ticker
+        # then re-emits the prefill stage every 250ms with the real elapsed
+        # time so the operator can SEE that prefill is still going (not
+        # stuck) — critical on CPU boxes where prefill can take minutes.
+        # The ticker stops on its own as soon as the first token arrives
+        # (which is when the generate stage takes over).
+        self.progress_changed.emit("prefill", {"elapsed_s": 0.0})
+
+        progress: dict[str, Any] = {
+            "start": time.monotonic(),
+            "first_token_at": None,
+            "tokens": 0,
+            "last_emit": 0.0,
+        }
+        ticker_stop = threading.Event()
+
+        def _prefill_ticker() -> None:
+            # Tick every 250ms; emits {"elapsed_s": float} so the status
+            # bar shows 'prefill 0.5s', 'prefill 0.7s', ... until the
+            # first token arrives (or the turn finishes / cancels).
+            while not ticker_stop.wait(0.25):
+                if progress["first_token_at"] is not None:
+                    return
+                self.progress_changed.emit(
+                    "prefill", {"elapsed_s": time.monotonic() - progress["start"]}
+                )
+
+        ticker_thread = threading.Thread(
+            target=_prefill_ticker, name="AgentWorker-prefill-ticker", daemon=True
+        )
+        ticker_thread.start()
 
         def _on_chunk(chunk: ChatChunk) -> None:
             if not chunk.done and chunk.delta:
+                now = time.monotonic()
+                if progress["first_token_at"] is None:
+                    progress["first_token_at"] = now
+                progress["tokens"] += 1
                 self.token.emit(chunk.delta)
+                # Throttle generate-stage emissions to ~5/s; tokens are
+                # cheap to emit but recomputing tok/s every chunk is
+                # wasteful on UI repaint.
+                if now - progress["last_emit"] >= 0.2:
+                    progress["last_emit"] = now
+                    generated_for = max(1e-3, now - progress["first_token_at"])
+                    tok_s = progress["tokens"] / generated_for
+                    self.progress_changed.emit(
+                        "generate",
+                        {
+                            "tokens": progress["tokens"],
+                            "tok_s": tok_s,
+                            "elapsed_s": now - progress["start"],
+                        },
+                    )
 
         def _on_tool(name: str, args: dict[str, Any], result: ToolResult) -> None:
             self.tool_finished.emit(name, args, result)
@@ -78,15 +138,39 @@ class AgentWorker(QObject):
         self.agent.add_tool_start_observer(_on_tool_start)
         self.agent.add_plan_observer(_on_plan)
         try:
-            start = time.monotonic()
+            start = progress["start"]
             turn = self.agent.handle_user(user_text, stream=self._stream_enabled)
             elapsed = time.monotonic() - start
+            ticker_stop.set()
+            # Always emit a final "generate" snapshot so the status bar
+            # shows a real tok/s ratio (the throttled in-stream snapshot
+            # may be slightly stale).
+            if progress["tokens"] > 0 and progress["first_token_at"] is not None:
+                generated_for = max(1e-3, time.monotonic() - progress["first_token_at"])
+                self.progress_changed.emit(
+                    "generate",
+                    {
+                        "tokens": progress["tokens"],
+                        "tok_s": progress["tokens"] / generated_for,
+                        "elapsed_s": elapsed,
+                    },
+                )
+            self.progress_changed.emit(
+                "done",
+                {
+                    "prompt_tokens": 0,
+                    "completion_tokens": progress["tokens"],
+                    "elapsed_s": elapsed,
+                },
+            )
             self.turn_finished.emit(turn.assistant_text, len(turn.tool_results), elapsed)
             self.state_changed.emit("idle")
         except Exception as exc:  # noqa: BLE001 - surface to UI, don't crash thread
             self.error.emit(f"{type(exc).__name__}: {exc}")
             self.state_changed.emit("error")
         finally:
+            ticker_stop.set()
+            self.progress_changed.emit("idle", {})
             with contextlib.suppress(ValueError):
                 self.agent._stream_observers.remove(_on_chunk)
             with contextlib.suppress(ValueError):
@@ -95,6 +179,20 @@ class AgentWorker(QObject):
                 self.agent._tool_start_observers.remove(_on_tool_start)
             with contextlib.suppress(ValueError):
                 self.agent._plan_observers.remove(_on_plan)
+
+    @Slot()
+    def request_cancel(self) -> None:
+        """Cancel the in-flight turn.
+
+        Safe to call from any thread — ``Agent.request_cancel`` sets a
+        ``threading.Event`` and closes the inference HTTP connection, which
+        unblocks a slow CPU prefill immediately. ``submit`` then returns
+        through its normal "cancelled" path.
+        """
+        with contextlib.suppress(Exception):
+            self.agent.request_cancel()
+        self.state_changed.emit("cancelled")
+        self.cancelled.emit()
 
     @Slot()
     def shutdown(self) -> None:
