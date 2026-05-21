@@ -7,7 +7,10 @@ chat API is documented here: https://github.com/ollama/ollama/blob/main/docs/api
 
 from __future__ import annotations
 
+import contextlib
 import json
+import socket
+import threading
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -66,8 +69,38 @@ class OllamaClient:
         self.timeout = timeout
         self._client = client or httpx.Client(timeout=timeout)
         self._owns_client = client is None
+        # Track the in-flight streaming response so ``close()`` from
+        # another thread can abort a slow CPU prefill mid-read. Without
+        # this, ``client.close()`` only shuts down the connection pool
+        # and the blocked ``iter_lines()`` call keeps waiting.
+        self._active_response: httpx.Response | None = None
+        self._response_lock = threading.Lock()
 
     def close(self) -> None:
+        # Two-stage abort so a blocked ``iter_lines()`` in another thread
+        # unwinds immediately rather than waiting for the (potentially
+        # 600s) HTTP read timeout:
+        #   1. SHUT_RDWR the active response's underlying socket. This
+        #      makes the pending recv() return with an "incomplete chunked
+        #      read" httpx error, which we turn into ``OllamaError``.
+        #   2. Then close the httpx ``Response`` and the connection pool.
+        # ``response.close()`` alone does NOT abort a blocked iter_lines,
+        # because httpx's connection pool returns the connection to its
+        # idle set rather than tearing down the socket.
+        with self._response_lock:
+            resp = self._active_response
+            self._active_response = None
+        if resp is not None:
+            try:
+                ns = resp.extensions.get("network_stream")
+                sock = ns.get_extra_info("socket") if ns is not None else None
+                if sock is not None:
+                    with contextlib.suppress(OSError):
+                        sock.shutdown(socket.SHUT_RDWR)
+            except Exception:  # noqa: BLE001 - best-effort abort from another thread
+                pass
+            with contextlib.suppress(Exception):
+                resp.close()
         if self._owns_client:
             self._client.close()
 
@@ -180,35 +213,52 @@ class OllamaClient:
             with self._client.stream(
                 "POST", f"{self.host}/api/chat", json=body, timeout=self.timeout
             ) as resp:
-                if resp.status_code != 200:
-                    body_text = resp.read().decode("utf-8", errors="replace")[:500]
-                    raise OllamaError(f"Ollama returned HTTP {resp.status_code}: {body_text}")
-                for line in resp.iter_lines():
-                    if not line:
-                        continue
-                    try:
-                        record = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    msg_data = record.get("message", {}) or {}
-                    delta = msg_data.get("content", "") or ""
-                    if delta:
-                        accumulated_content.append(delta)
-                    chunk_tool_calls = msg_data.get("tool_calls") or []
-                    if chunk_tool_calls:
-                        accumulated_tool_calls.extend(chunk_tool_calls)
-                    done = bool(record.get("done", False))
-                    if done:
-                        final = ChatMessage(
-                            role="assistant",
-                            content="".join(accumulated_content),
-                            tool_calls=accumulated_tool_calls,
-                        )
-                        yield StreamChunk(delta=delta, done=True, message=final, raw=record)
-                    else:
-                        yield StreamChunk(delta=delta, done=False, raw=record)
+                with self._response_lock:
+                    self._active_response = resp
+                try:
+                    if resp.status_code != 200:
+                        body_text = resp.read().decode("utf-8", errors="replace")[:500]
+                        raise OllamaError(f"Ollama returned HTTP {resp.status_code}: {body_text}")
+                    yield from self._yield_stream_chunks(
+                        resp, accumulated_content, accumulated_tool_calls
+                    )
+                finally:
+                    with self._response_lock:
+                        if self._active_response is resp:
+                            self._active_response = None
         except httpx.HTTPError as exc:
             raise OllamaError(f"Ollama stream failed: {exc}") from exc
+
+    def _yield_stream_chunks(
+        self,
+        resp: httpx.Response,
+        accumulated_content: list[str],
+        accumulated_tool_calls: list[dict[str, Any]],
+    ) -> Iterator[StreamChunk]:
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            msg_data = record.get("message", {}) or {}
+            delta = msg_data.get("content", "") or ""
+            if delta:
+                accumulated_content.append(delta)
+            chunk_tool_calls = msg_data.get("tool_calls") or []
+            if chunk_tool_calls:
+                accumulated_tool_calls.extend(chunk_tool_calls)
+            done = bool(record.get("done", False))
+            if done:
+                final = ChatMessage(
+                    role="assistant",
+                    content="".join(accumulated_content),
+                    tool_calls=accumulated_tool_calls,
+                )
+                yield StreamChunk(delta=delta, done=True, message=final, raw=record)
+            else:
+                yield StreamChunk(delta=delta, done=False, raw=record)
 
     def summarize(
         self,

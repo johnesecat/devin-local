@@ -225,6 +225,78 @@ def test_stream_user_yields_chunks_before_turn_completes(workspace: Path) -> Non
         agent.shutdown()
 
 
+def test_tool_started_fires_before_tool_executes(workspace: Path) -> None:
+    """tool_started observers MUST fire before the tool is dispatched, not after
+    (Devin Review BUG_0001).
+
+    Adversarial design: the tool_started observer asserts that the file the
+    write_file tool is about to create does NOT yet exist on disk. If
+    tool_started fires after dispatch (the bug), the file will already exist
+    when the observer runs and the assertion will fail. The test passing
+    implies the observer fires before tool execution.
+    """
+    turn1_final = ChatMessage(
+        role="assistant",
+        content="",
+        tool_calls=[
+            {
+                "function": {
+                    "name": "write_file",
+                    "arguments": {"path": "before_or_after.txt", "content": "hi"},
+                }
+            }
+        ],
+    )
+    turn2_final = ChatMessage(role="assistant", content="Done.", tool_calls=[])
+    backend = _ScriptedBackend(
+        script=[
+            [("", True, turn1_final)],
+            [("", True, turn2_final)],
+        ]
+    )
+    agent = Agent(
+        AgentConfig(
+            workspace=workspace,
+            model="any",
+            enable_mcp=False,
+            enable_plugins=False,
+            enable_knowledge_injection=False,
+            enable_skill_injection=False,
+            enable_desktop=False,
+            enable_browser=False,
+        ),
+        backend=backend,
+    )
+
+    target = workspace / "before_or_after.txt"
+    events: list[tuple[str, bool]] = []  # (event_kind, file_exists_at_emit)
+
+    def _on_start(name: str, args: dict[str, Any]) -> None:
+        events.append(("started", target.exists()))
+
+    def _on_finish(name: str, args: dict[str, Any], result: Any) -> None:
+        events.append(("finished", target.exists()))
+
+    agent.add_tool_start_observer(_on_start)
+    agent.add_tool_observer(_on_finish)
+    try:
+        turn = agent.handle_user("write the file", stream=False)
+    finally:
+        agent.shutdown()
+    # Both events fired.
+    assert [e[0] for e in events] == ["started", "finished"]
+    # tool_started observed the file NOT yet existing (i.e. before dispatch).
+    assert events[0] == ("started", False), (
+        f"tool_started fired AFTER dispatch — file already existed when "
+        f"observer ran: events={events}"
+    )
+    # tool_finished observed the file existing (i.e. after dispatch).
+    assert events[1] == ("finished", True)
+    # And the actual write happened.
+    assert target.read_text() == "hi"
+    assert turn.iterations == 2
+
+
 def test_agent_caches_system_prompt_across_turns(workspace: Path) -> None:
     backend = _ScriptedBackend(
         script=[
